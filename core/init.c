@@ -2,6 +2,61 @@
 
 extern struct uwsgi_server uwsgi;
 
+struct http_status_codes {
+        const char key[3];
+        const char *message;
+        int message_size;
+};
+
+/* statistically ordered */
+struct http_status_codes hsc[] = {
+        {"200", "OK"},
+        {"302", "Found"},
+        {"404", "Not Found"},
+        {"500", "Internal Server Error"},
+        {"301", "Moved Permanently"},
+        {"304", "Not Modified"},
+        {"303", "See Other"},
+        {"403", "Forbidden"},
+        {"307", "Temporary Redirect"},
+        {"401", "Unauthorized"},
+        {"400", "Bad Request"},
+        {"405", "Method Not Allowed"},
+        {"408", "Request Timeout"},
+
+        {"100", "Continue"},
+        {"101", "Switching Protocols"},
+        {"201", "Created"},
+        {"202", "Accepted"},
+        {"203", "Non-Authoritative Information"},
+        {"204", "No Content"},
+        {"205", "Reset Content"},
+        {"206", "Partial Content"},
+        {"300", "Multiple Choices"},
+        {"305", "Use Proxy"},
+        {"402", "Payment Required"},
+        {"406", "Not Acceptable"},
+        {"407", "Proxy Authentication Required"},
+        {"409", "Conflict"},
+        {"410", "Gone"},
+        {"411", "Length Required"},
+        {"412", "Precondition Failed"},
+        {"413", "Request Entity Too Large"},
+        {"414", "Request-URI Too Long"},
+        {"415", "Unsupported Media Type"},
+        {"416", "Requested Range Not Satisfiable"},
+        {"417", "Expectation Failed"},
+        {"501", "Not Implemented"},
+        {"502", "Bad Gateway"},
+        {"503", "Service Unavailable"},
+        {"504", "Gateway Timeout"},
+        {"505", "HTTP Version Not Supported"},
+        {"", NULL},
+};
+
+
+
+
 void uwsgi_init_default() {
 
 	uwsgi.cpus = 1;
@@ -14,7 +69,6 @@ void uwsgi_init_default() {
 	uwsgi.signal_socket = -1;
 	uwsgi.my_signal_socket = -1;
 	uwsgi.cache_server_fd = -1;
-	uwsgi.cache_blocksize = UMAX16;
 	uwsgi.stats_fd = -1;
 
 	uwsgi.stats_pusher_default_freq = 3;
@@ -53,11 +107,15 @@ void uwsgi_init_default() {
 
 	uwsgi.log_master_bufsize = 8192;
 
+	uwsgi.worker_reload_mercy = 60;
+
 	uwsgi.max_vars = MAX_VARS;
 	uwsgi.vec_size = 4 + 1 + (4 * MAX_VARS);
 
 	uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT] = 4;
 	uwsgi.shared->options[UWSGI_OPTION_LOGGING] = 1;
+
+	uwsgi.shared->options[UWSGI_OPTION_MIN_WORKER_LIFETIME] = 60;
 
 #ifdef UWSGI_SPOOLER
 	uwsgi.shared->spooler_frequency = 30;
@@ -73,6 +131,11 @@ void uwsgi_init_default() {
 
 	uwsgi.shared->worker_log_pipe[0] = -1;
 	uwsgi.shared->worker_log_pipe[1] = -1;
+
+	uwsgi.shared->worker_req_log_pipe[0] = -1;
+	uwsgi.shared->worker_req_log_pipe[1] = -1;
+
+	uwsgi.req_log_fd = 2;
 
 #ifdef UWSGI_SSL
 	// 1 day of tolerance
@@ -90,6 +153,14 @@ void uwsgi_init_default() {
 	uwsgi.multicast_loop = 1;
 #endif
 
+	// filling http status codes
+	struct http_status_codes *http_sc;
+        for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
+                http_sc->message_size = strlen(http_sc->message);
+        }
+
+	uwsgi.wait_write_hook = uwsgi_simple_wait_write_hook;
+	uwsgi.buffer_write_hook = uwsgi_buffer_write_simple;
 	uwsgi_websockets_init();
 }
 
@@ -267,7 +338,7 @@ void uwsgi_setup_workers() {
 
 	total_memory *= (uwsgi.numproc + uwsgi.master_process);
 	if (uwsgi.numproc > 0)
-		uwsgi_log("mapped %lu bytes (%lu KB) for %d cores\n", total_memory, total_memory / 1024, uwsgi.cores * uwsgi.numproc);
+		uwsgi_log("mapped %llu bytes (%llu KB) for %d cores\n", (unsigned long long) total_memory, (unsigned long long) (total_memory / 1024), uwsgi.cores * uwsgi.numproc);
 
 }
 
@@ -351,9 +422,26 @@ void sanitize_args() {
                 exit(1);
         }
 
-        if (uwsgi.static_cache_paths > 0 && !uwsgi.cache_max_items) {
+        if (uwsgi.static_cache_paths && !uwsgi.caches) {
                 uwsgi_log("caching of static paths requires uWSGI caching !!!\n");
                 exit(1);
         }
+
+	if (uwsgi.shared->options[UWSGI_OPTION_MAX_WORKER_LIFETIME] > 0 && uwsgi.shared->options[UWSGI_OPTION_MIN_WORKER_LIFETIME] >= uwsgi.shared->options[UWSGI_OPTION_MAX_WORKER_LIFETIME]) {
+		uwsgi_log("invalid min-worker-lifetime value (%d), must be lower than max-worker-lifetime (%d)\n",
+			uwsgi.shared->options[UWSGI_OPTION_MIN_WORKER_LIFETIME], uwsgi.shared->options[UWSGI_OPTION_MAX_WORKER_LIFETIME]);
+		exit(1);
+	}
+
 }
 
+const char *uwsgi_http_status_msg(char *status, uint16_t *len) {
+	struct http_status_codes *http_sc;
+	for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
+                if (!strncmp(http_sc->key, status, 3)) {
+                        *len = http_sc->message_size;
+			return http_sc->message;
+                }
+        }
+	return NULL;
+}

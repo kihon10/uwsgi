@@ -30,7 +30,7 @@ void set_dyn_pyhome(char *home, uint16_t pyhome_len) {
 
 	PyObject *pysys_dict = get_uwsgi_pydict("sys");
 
-	PyObject *pypath = pypath = PyDict_GetItemString(pysys_dict, "path");
+	PyObject *pypath = PyDict_GetItemString(pysys_dict, "path");
 	if (!pypath) {
 		PyErr_Print();
 		exit(1);
@@ -339,6 +339,8 @@ int init_uwsgi_app(int loader, void *arg1, struct wsgi_request *wsgi_req, PyThre
 	}
 
 	// cache most used values
+	wi->error = PyFile_FromFile(stderr, "wsgi_errors", "w", NULL);
+	Py_INCREF(wi->error);
 
 	wi->gateway_version = PyTuple_New(2);
         PyTuple_SetItem(wi->gateway_version, 0, PyInt_FromLong(1));

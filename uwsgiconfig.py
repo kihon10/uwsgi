@@ -82,6 +82,7 @@ report['spooler'] = False
 report['debug'] = False
 report['plugin_dir'] = False
 report['ipv6'] = False
+report['zlib'] = False
 
 compile_queue = None
 print_lock = None
@@ -453,11 +454,11 @@ class uConf(object):
         self.config.read(filename)
         self.gcc_list = ['core/utils', 'core/protocol', 'core/socket', 'core/logging', 'core/master', 'core/master_utils', 'core/emperor',
             'core/notify', 'core/mule', 'core/subscription', 'core/stats', 'core/sendfile',
-            'core/offload', 'core/io', 'core/static', 'core/websockets',
-            'core/setup_utils', 'core/clock', 'core/init', 'core/buffer',
-            'core/plugins', 'core/lock', 'core/cache', 'core/daemons',
-            'core/queue', 'core/event', 'core/signal', 'core/cluster',
-            'core/rpc', 'core/gateway', 'core/loop', 'lib/rbtree', 'core/rb_timers', 'core/uwsgi']
+            'core/offload', 'core/io', 'core/static', 'core/websockets', 'core/channels',
+            'core/setup_utils', 'core/clock', 'core/init', 'core/buffer', 'core/writer',
+            'core/plugins', 'core/lock', 'core/cache', 'core/daemons', 'core/errors', 'core/hash',
+            'core/queue', 'core/event', 'core/signal', 'core/cluster', 'core/strings',
+            'core/rpc', 'core/gateway', 'core/loop', 'core/rb_timers', 'core/uwsgi']
         # add protocols
         self.gcc_list.append('proto/base')
         self.gcc_list.append('proto/uwsgi')
@@ -593,6 +594,12 @@ class uConf(object):
                 self.cflags.append('-DUWSGI_HAS_EXECINFO')
                 self.libs.append('-lexecinfo')
                 report['execinfo'] = True
+
+        if self.has_include('zlib.h'):
+            self.cflags.append('-DUWSGI_ZLIB')
+            self.libs.append('-lz')
+            self.gcc_list.append('core/zlib')
+            report['zlib'] = True
 
         if uwsgi_os == 'OpenBSD':
             try:
@@ -1127,7 +1134,8 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
 
     sys.path.insert(0, path)
     import uwsgiplugin as up
-    reload(up)
+    if sys.argv[1] != '--plugin':
+        reload(up)
 
     requires = []
 
@@ -1217,7 +1225,6 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
         p_cflags.remove('-pie')
     except:
         pass
-
 
     #for ofile in up.OBJ_LIST:
     #    gcc_list.insert(0,ofile)

@@ -3,17 +3,9 @@
 extern struct uwsgi_server uwsgi;
 struct uwsgi_python up;
 
-extern struct http_status_codes hsc[];
-
 #include <glob.h>
 
 extern PyTypeObject uwsgi_InputType;
-
-void python_simple_hook_write_string(struct wsgi_request *wsgi_req, PyObject *str) {
-	UWSGI_RELEASE_GIL
-        wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, PyString_AsString(str), PyString_Size(str));
-	UWSGI_GET_GIL
-}
 
 void uwsgi_opt_pythonpath(char *opt, char *value, void *foobar) {
 
@@ -257,7 +249,6 @@ pep405:
 	up.wsgi_spitout = PyCFunction_New(uwsgi_spit_method, NULL);
 	up.wsgi_writeout = PyCFunction_New(uwsgi_write_method, NULL);
 
-	up.hook_write_string = python_simple_hook_write_string;
 	up.hook_wsgi_input_read = uwsgi_python_hook_simple_input_read;
 	up.hook_wsgi_input_readline = uwsgi_python_hook_simple_input_readline;
 
@@ -455,7 +446,7 @@ PyObject *uwsgi_pyimport_by_filename(char *name, char *filename) {
 		fclose(pyfile);
 	}
 	else {
-		int pycontent_size = 0;
+		size_t pycontent_size = 0;
 		char *pycontent = uwsgi_open_and_read(filename, &pycontent_size, 1, NULL);
 
 		if (pycontent) {
@@ -601,7 +592,11 @@ void init_uwsgi_embedded_module() {
 	PyObject *new_uwsgi_module, *zero;
 	int i;
 
-	PyType_Ready(&uwsgi_InputType);
+	if (PyType_Ready(&uwsgi_InputType) < 0) {
+		PyErr_Print();
+		uwsgi_log("could not initialize the uwsgi python module\n");
+		exit(1);
+	}
 
 	/* initialize for stats */
 	up.workers_tuple = PyTuple_New(uwsgi.numproc);
@@ -1100,8 +1095,6 @@ void uwsgi_python_preinit_apps() {
 
 void uwsgi_python_init_apps() {
 
-	struct http_status_codes *http_sc;
-
 	// lazy ?
 	if (uwsgi.mywid > 0) {
 		UWSGI_GET_GIL;
@@ -1197,10 +1190,6 @@ next:
 	}
 	if (up.pump != NULL) {
 		init_uwsgi_app(LOADER_UWSGI, up.pump, uwsgi.wsgi_req, up.main_thread, PYTHON_APP_TYPE_PUMP);
-		// filling http status codes
-        	for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
-                	http_sc->message_size = (int) strlen(http_sc->message);
-        	}
 	}
 	if (up.wsgi_lite != NULL) {
 		init_uwsgi_app(LOADER_UWSGI, up.wsgi_lite, uwsgi.wsgi_req, up.main_thread, PYTHON_APP_TYPE_WSGI_LITE);
@@ -1773,9 +1762,7 @@ int uwsgi_python_mule(char *opt) {
 
 	if (uwsgi_endswith(opt, ".py")) {
 		UWSGI_GET_GIL;
-		if (uwsgi_pyimport_by_filename("__main__", opt) == NULL) {
-			return 0;
-		}
+		uwsgi_pyimport_by_filename("__main__", opt);
 		UWSGI_RELEASE_GIL;
 		return 1;
 	}
@@ -1819,7 +1806,7 @@ void uwsgi_python_harakiri(int wid) {
 		char *address = uwsgi_concat2(up.tracebacker, uwsgi_num2str(wid));
 
         	int fd = uwsgi_connect(address, -1, 0);
-        	for (;;) {
+        	while (fd >= 0) {
                 	int ret = uwsgi_waitfd(fd, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT]);
                 	if (ret <= 0) {
 				break;

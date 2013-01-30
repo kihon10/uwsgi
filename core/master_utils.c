@@ -78,6 +78,7 @@ int uwsgi_calc_cheaper(void) {
 #endif
 			uwsgi.workers[oldest_worker].cheaped = 1;
 			uwsgi.workers[oldest_worker].manage_next_request = 0;
+			uwsgi.workers[oldest_worker].stopped_at = now;
 			// wakeup task in case of wait
 			(void) kill(uwsgi.workers[oldest_worker].pid, SIGWINCH);
 		}
@@ -504,6 +505,8 @@ int uwsgi_respawn_worker(int wid) {
 	uwsgi.workers[wid].pending_harakiri = 0;
 	uwsgi.workers[wid].rss_size = 0;
 	uwsgi.workers[wid].vsz_size = 0;
+	// ... reset stopped_at
+	uwsgi.workers[wid].stopped_at = 0;
 
 	// internal statuses should be reset too
 
@@ -516,6 +519,9 @@ int uwsgi_respawn_worker(int wid) {
 	uwsgi.workers[wid].delta_requests = 0;
 
 	int i;
+
+	// reset channels subscriptions
+	uwsgi_channels_reset_worker_subscriptions(wid);
 
 	if (uwsgi.threaded_logger) {
 		pthread_mutex_lock(&uwsgi.threaded_logger_lock);
@@ -555,6 +561,11 @@ int uwsgi_respawn_worker(int wid) {
 
 		// reset the apps count with a copy from the master 
 		uwsgi.workers[uwsgi.mywid].apps_cnt = uwsgi.workers[0].apps_cnt;
+
+		// reset wsgi_request structures
+		for(i=0;i<uwsgi.cores;i++) {
+			memset(&uwsgi.workers[uwsgi.mywid].cores[i].req, 0, sizeof(struct wsgi_request));
+		}
 
 		uwsgi_fixup_fds(wid, 0, NULL);
 
@@ -716,7 +727,7 @@ void uwsgi_manage_command_cron(time_t now) {
 			}
 		}
 		if (current_cron->month < 0) {
-			if ((uwsgi_cron_delta->tm_hour % abs(current_cron->month)) == 0) {
+			if ((uwsgi_cron_delta->tm_mon % abs(current_cron->month)) == 0) {
 				uc_month = uwsgi_cron_delta->tm_mon;
 			}
 		}
@@ -862,35 +873,63 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 	if (uwsgi_stats_comma(us))
 		goto end;
 
-	if (uwsgi.cache_max_items > 0) {
-		if (uwsgi_stats_key(us, "cache"))
+	if (uwsgi.caches) {
+
+		
+		if (uwsgi_stats_key(us, "caches"))
                 goto end;
 
-		if (uwsgi_stats_object_open(us))
-                        goto end;
+		if (uwsgi_stats_list_open(us)) goto end;
 
-		if (uwsgi_stats_keylong_comma(us, "max_items", (unsigned long long) uwsgi.cache_max_items))
-			goto end;
+		struct uwsgi_cache *uc = uwsgi.caches;
+		while(uc) {
+			if (uwsgi_stats_object_open(us))
+                        	goto end;
 
-		if (uwsgi_stats_keylong_comma(us, "blocksize", (unsigned long long) uwsgi.cache_blocksize))
-			goto end;
+			if (uwsgi_stats_keyval_comma(us, "name", uc->name ? uc->name : "default"))
+                        	goto end;
 
-		if (uwsgi_stats_keylong_comma(us, "items", (unsigned long long) ushared->cache_items))
-			goto end;
+			if (uwsgi_stats_keyval_comma(us, "hash", uc->hash->name))
+                        	goto end;
 
-		if (uwsgi_stats_keylong_comma(us, "hits", (unsigned long long) ushared->cache_hits))
-			goto end;
+			if (uwsgi_stats_keylong_comma(us, "hashsize", (unsigned long long) uc->hashsize))
+				goto end;
 
-		if (uwsgi_stats_keylong_comma(us, "miss", (unsigned long long) ushared->cache_miss))
-			goto end;
+			if (uwsgi_stats_keylong_comma(us, "keysize", (unsigned long long) uc->keysize))
+				goto end;
 
-		if (uwsgi_stats_keylong(us, "full", (unsigned long long) ushared->cache_full))
-			goto end;
+			if (uwsgi_stats_keylong_comma(us, "max_items", (unsigned long long) uc->max_items))
+				goto end;
 
-		if (uwsgi_stats_object_close(us))
-			goto end;
+			if (uwsgi_stats_keylong_comma(us, "blocks", (unsigned long long) uc->blocks))
+				goto end;
 
-	if (uwsgi_stats_comma(us))
+			if (uwsgi_stats_keylong_comma(us, "blocksize", (unsigned long long) uc->blocksize))
+				goto end;
+
+			if (uwsgi_stats_keylong_comma(us, "items", (unsigned long long) uc->n_items))
+				goto end;
+
+			if (uwsgi_stats_keylong_comma(us, "hits", (unsigned long long) uc->hits))
+				goto end;
+
+			if (uwsgi_stats_keylong_comma(us, "miss", (unsigned long long) uc->miss))
+				goto end;
+
+			if (uwsgi_stats_keylong(us, "full", (unsigned long long) uc->full))
+				goto end;
+
+			if (uwsgi_stats_object_close(us))
+				goto end;
+
+			if (uc->next) {
+				if (uwsgi_stats_comma(us))
+					goto end;
+			}
+			uc = uc->next;
+		}
+
+		if (uwsgi_stats_comma(us))
 		goto end;
 	}
 
@@ -1085,7 +1124,18 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 			if (uwsgi_stats_keylong_comma(us, "offloaded_requests", (unsigned long long) uc->offloaded_requests))
 				goto end;
 
-			if (uwsgi_stats_keylong(us, "in_request", (unsigned long long) uc->in_request))
+			if (uwsgi_stats_keylong_comma(us, "in_request", (unsigned long long) uc->in_request))
+				goto end;
+
+			if (uwsgi_stats_key(us, "vars"))
+				goto end;
+
+			if (uwsgi_stats_list_open(us))
+                        	goto end;
+
+			if (uwsgi_stats_dump_vars(us, uc)) goto end;
+
+			if (uwsgi_stats_list_close(us))
 				goto end;
 
 
@@ -1155,6 +1205,7 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 #endif
 
 #ifdef UWSGI_SSL
+	struct uwsgi_legion *legion = NULL;
 	if (uwsgi.legions) {
 
 		if (uwsgi_stats_comma(us))
@@ -1166,7 +1217,7 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 		if (uwsgi_stats_list_open(us))
 			goto end;
 
-		struct uwsgi_legion *legion = uwsgi.legions;
+		legion = uwsgi.legions;
 		while (legion) {
 			if (uwsgi_stats_object_open(us))
 				goto end;
@@ -1236,30 +1287,30 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 			struct uwsgi_legion_node *node = legion->nodes_head;
 			while (node) {
 				if (uwsgi_stats_object_open(us))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_keyvaln_comma(us, "name", node->name, node->name_len))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_keyval_comma(us, "uuid", node->uuid))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_keylong_comma(us, "valor", (unsigned long long) node->valor))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_keylong_comma(us, "checksum", (unsigned long long) node->checksum))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_keylong(us, "last_seen", (unsigned long long) node->last_seen))
-					goto end;
+					goto unlock_legion_mutex;
 
 				if (uwsgi_stats_object_close(us))
-					goto end;
+					goto unlock_legion_mutex;
 
 				node = node->next;
 				if (node) {
 					if (uwsgi_stats_comma(us))
-						goto end;
+						goto unlock_legion_mutex;
 				}
 			}
 			pthread_mutex_unlock(&legion->lock);
@@ -1288,6 +1339,11 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 		goto end;
 
 	return us;
+#ifdef UWSGI_SSL
+unlock_legion_mutex:
+	if (legion)
+		pthread_mutex_unlock(&legion->lock);
+#endif
 end:
 	free(us->base);
 	free(us);

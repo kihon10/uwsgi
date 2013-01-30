@@ -3,8 +3,9 @@
 #define COREROUTER_STATUS_RECV_HDR 2
 #define COREROUTER_STATUS_RESPONSE 3
 
-#define cr_add_timeout(u, x) uwsgi_add_rb_timer(u->timeouts, time(NULL)+u->socket_timeout, x)
-#define cr_del_timeout(u, x) rb_erase(&x->timeout->rbt, u->timeouts); free(x->timeout);
+#define cr_add_timeout(u, x) uwsgi_add_rb_timer(u->timeouts, uwsgi_now()+u->socket_timeout, x)
+#define cr_add_timeout_fast(u, x, t) uwsgi_add_rb_timer(u->timeouts, t+u->socket_timeout, x)
+#define cr_del_timeout(u, x) uwsgi_del_rb_timer(u->timeouts, x->timeout); free(x->timeout);
 
 #define cr_try_again if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {\
                      	errno = EINPROGRESS;\
@@ -57,7 +58,12 @@
         }\
         peer->in->pos += len;\
 
-#define cr_reset_hooks(peer) if (uwsgi_cr_set_hooks(peer->session->main_peer, peer->session->main_peer->last_hook_read, NULL)) return -1;\
+#define cr_reset_hooks(peer) if(!peer->session->main_peer->disabled) {\
+			if (uwsgi_cr_set_hooks(peer->session->main_peer, peer->session->main_peer->last_hook_read, NULL)) return -1;\
+		}\
+		else {\
+			if (uwsgi_cr_set_hooks(peer->session->main_peer, NULL, NULL)) return -1;\
+		}\
 		struct corerouter_peer *peers = peer->session->peers;\
                 while(peers) {\
                         if (uwsgi_cr_set_hooks(peers, peers->last_hook_read, NULL)) return -1;\
@@ -113,6 +119,9 @@ struct corerouter_peer {
 	int fd;
 	// the session
 	struct corerouter_session *session;
+
+	// if set do not wait for events
+	int disabled;
 
 	// hook to run on a read event
 	ssize_t (*hook_read)(struct corerouter_peer *);
@@ -187,9 +196,10 @@ struct uwsgi_corerouter {
         int processes;
         int quiet;
 
-        struct rb_root *timeouts;
+        struct uwsgi_rbtree *timeouts;
 
-        int use_cache;
+        char *use_cache;
+	struct uwsgi_cache *cache;
         int nevents;
 
 	int max_retries;
@@ -242,6 +252,8 @@ struct uwsgi_corerouter {
 
 	int interesting_fd;
 
+	uint64_t active_sessions;
+
 };
 
 // a session is started when a client connect to the router
@@ -262,13 +274,18 @@ struct corerouter_session {
 	void (*close)(struct corerouter_session *);
 	int (*retry)(struct corerouter_peer *);
 
+	// leave the main peer alive
+	int can_keepalive;
+	// destroy the main peer after the last full write
+	int wait_full_write;
+
 	// this is the peer of the client
 	struct corerouter_peer *main_peer;
 	// this is the linked list of backends
 	struct corerouter_peer *peers;
 
-	// when it reaches 0 the session can be destroyed
-	uint64_t refcnt;
+	// connect after the next successfull write
+	struct corerouter_peer *connect_peer_after_write;
 };
 
 void uwsgi_opt_corerouter(char *, char *, void *);
@@ -309,3 +326,4 @@ int uwsgi_cr_set_hooks(struct corerouter_peer *, ssize_t (*)(struct corerouter_p
 struct corerouter_peer *uwsgi_cr_peer_add(struct corerouter_session *);
 struct corerouter_peer *uwsgi_cr_peer_find_by_sid(struct corerouter_session *, uint32_t);
 void corerouter_close_peer(struct uwsgi_corerouter *, struct corerouter_peer *);
+struct uwsgi_rb_timer *corerouter_reset_timeout(struct uwsgi_corerouter *, struct corerouter_peer *);

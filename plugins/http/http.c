@@ -24,15 +24,19 @@ struct uwsgi_option http_options[] = {
 	{"http-zerg", required_argument, 0, "attach the http router to a zerg server", uwsgi_opt_corerouter_zerg, &uhttp, 0 },
 	{"http-fallback", required_argument, 0, "fallback to the specified node in case of error", uwsgi_opt_add_string_list, &uhttp.cr.fallback, 0},
 	{"http-modifier1", required_argument, 0, "set uwsgi protocol modifier1", uwsgi_opt_set_int, &uhttp.modifier1, 0},
-	{"http-use-cache", no_argument, 0, "use uWSGI cache as key->value virtualhost mapper", uwsgi_opt_true, &uhttp.cr.use_cache, 0},
+	{"http-use-cache", optional_argument, 0, "use uWSGI cache as key->value virtualhost mapper", uwsgi_opt_set_str, &uhttp.cr.use_cache, 0},
 	{"http-use-pattern", required_argument, 0, "use the specified pattern for mapping requests to unix sockets", uwsgi_opt_corerouter_use_pattern, &uhttp, 0},
 	{"http-use-base", required_argument, 0, "use the specified base for mapping requests to unix sockets", uwsgi_opt_corerouter_use_base, &uhttp, 0},
 	{"http-use-cluster", no_argument, 0, "load balance to nodes subscribed to the cluster", uwsgi_opt_true, &uhttp.cr.use_cluster, 0},
 	{"http-events", required_argument, 0, "set the number of concurrent http async events", uwsgi_opt_set_int, &uhttp.cr.nevents, 0},
 	{"http-subscription-server", required_argument, 0, "enable the subscription server", uwsgi_opt_corerouter_ss, &uhttp, 0},
 	{"http-timeout", required_argument, 0, "set internal http socket timeout", uwsgi_opt_set_int, &uhttp.cr.socket_timeout, 0},
-	{"http-manage-expect", no_argument, 0, "manage the Expect HTTP request header", uwsgi_opt_true, &uhttp.manage_expect, 0},
-	{"http-keepalive", no_argument, 0, "experimental HTTP keepalive support (non-pipelined) requests (requires backend support)", uwsgi_opt_true, &uhttp.keepalive, 0},
+	{"http-manage-expect", optional_argument, 0, "manage the Expect HTTP request header (optionally checking for Content-Length)", uwsgi_opt_set_64bit, &uhttp.manage_expect, 0},
+	{"http-keepalive", optional_argument, 0, "HTTP 1.1 keepalive support (non-pipelined) requests", uwsgi_opt_set_int, &uhttp.keepalive, 0},
+	{"http-auto-chunked", no_argument, 0, "automatically transform output to chunked encoding during HTTP 1.1 keepalive (if needed)", uwsgi_opt_true, &uhttp.auto_chunked, 0},
+#ifdef UWSGI_ZLIB
+	{"http-auto-gzip", no_argument, 0, "automatically gzip content if uWSGI-Encoding header is set to gzip, but content size (Content-Length/Transfer-Encoding) and Content-Encoding are not specified", uwsgi_opt_true, &uhttp.auto_gzip, 0},
+#endif
 
 	{"http-raw-body", no_argument, 0, "blindly send HTTP body to backends (required for WebSockets and Icecast support in backends)", uwsgi_opt_true, &uhttp.raw_body, 0},
 #ifdef UWSGI_SSL
@@ -94,7 +98,7 @@ int http_add_uwsgi_header(struct corerouter_peer *peer, char *hh, uint16_t hhlen
 	}
 
 #ifdef UWSGI_SSL
-	if (hr->websockets) {
+	else if (hr->websockets) {
 		if (!uwsgi_strncmp("UPGRADE", 7, hh, keylen)) {
 			if (!uwsgi_strnicmp(val, vallen, "websocket", 9)) {
 				hr->websockets++;
@@ -119,14 +123,35 @@ int http_add_uwsgi_header(struct corerouter_peer *peer, char *hh, uint16_t hhlen
 	}	
 #endif
 
-	if (!uwsgi_strncmp("CONTENT_LENGTH", 14, hh, keylen)) {
+	else if (!uwsgi_strncmp("CONTENT_LENGTH", 14, hh, keylen)) {
 		hr->content_length = uwsgi_str_num(val, vallen);
+		hr->session.can_keepalive = 0;
 	}
+
+	// in the future we could support chunked requests...
+	else if (!uwsgi_strncmp("TRANSFER_ENCODING", 17, hh, keylen)) {
+		hr->session.can_keepalive = 0;
+	}
+
+	else if (!uwsgi_strncmp("CONNECTION", 10, hh, keylen)) {
+		if (!uwsgi_strnicmp(val, vallen, "close", 5)) {
+			hr->session.can_keepalive = 0;
+		}
+	}
+
+#ifdef UWSGI_ZLIB
+	else if (uhttp.auto_gzip && !uwsgi_strncmp("ACCEPT_ENCODING", 15, hh, keylen)) {
+		if ( uwsgi_contains_n(val, vallen, "gzip", 4) ) {
+			hr->can_gzip = 1;
+		}
+	}
+#endif
 
 	if (uwsgi_strncmp("CONTENT_TYPE", 12, hh, keylen) && uwsgi_strncmp("CONTENT_LENGTH", 14, hh, keylen)) {
 		keylen += 5;
 		prefix = 1;
 	}
+
 
 	if (uwsgi_buffer_u16le(out, keylen)) return -1;
 
@@ -213,6 +238,9 @@ int http_headers_parse(struct corerouter_peer *peer) {
 			if (*(ptr + 1) != '\n')
 				return 0;
 			if (uwsgi_buffer_append_keyval(out, "SERVER_PROTOCOL", 15, base, ptr - base)) return -1;
+			if (uhttp.keepalive && !uwsgi_strncmp("HTTP/1.1", 8, base, ptr-base)) {
+				hr->session.can_keepalive = 1;
+			}
 			ptr += 2;
 			break;
 		}
@@ -289,45 +317,33 @@ int http_headers_parse(struct corerouter_peer *peer) {
 }
 
 
-/*
-
-// TODO fix it for ssl
-ssize_t hr_send_expect_continue(struct corerouter_peer *main_peer) {
-	struct corerouter_session *cs = main_peer->cs;
-	char *msg = "HTTP/1.0 100 Continue\r\n\r\n" ;
-	ssize_t len = -1;
-
-#ifdef UWSGI_SSL
+int hr_manage_expect_continue(struct corerouter_peer *peer) {
+	struct corerouter_session *cs = peer->session;
 	struct http_session *hr = (struct http_session *) cs;
-	if (!hr->ssl) {
-#endif
-		len = write(main_peer->fd, msg + cs->buffer_pos, 25 - cs->buffer_pos);
-		if (len < 0) {
-			cr_try_again;
-                	uwsgi_error("hr_send_expect_continue()");
-                	return -1;
+
+	if (uhttp.manage_expect > 1) {
+		if (hr->content_length > uhttp.manage_expect) {
+			if (uwsgi_buffer_append(peer->in, "HTTP/1.1 413 Request Entity Too Large\r\n\r\n", 41)) return -1;
+			hr->session.wait_full_write = 1;
+			goto ready;	
 		}
-
-		cs->buffer_pos += len;
-#ifdef UWSGI_SSL
-	}
-#endif
-
-	if (cs->buffer_pos == 25) {
-		cs->buffer_pos = 0;
-		uwsgi_cr_set_hooks(main_peer, NULL, NULL);
-		uwsgi_cr_set_hooks(cs->peers, NULL, hr_instance_send_request_header);
 	}
 
-	return len;
+	if (uwsgi_buffer_append(peer->in, "HTTP/1.1 100 Continue\r\n\r\n", 25)) return -1;
+	hr->session.connect_peer_after_write = peer;
+
+ready:
+	peer->session->main_peer->out = peer->in;
+        peer->session->main_peer->out_pos = 0;
+	cr_write_to_main(peer, hr->func_write);
+	return 0;
 }
 
-*/
 
 ssize_t hr_instance_write(struct corerouter_peer *peer) {
 	ssize_t len = cr_write(peer, "hr_instance_write()");
         // end on empty write
-        if (!len) return 0;
+        if (!len) { peer->session->can_keepalive = 0; return 0; }
 
         // the chunk has been sent, start (again) reading from client and instances
         if (cr_write_complete(peer)) {
@@ -344,6 +360,23 @@ ssize_t hr_instance_write(struct corerouter_peer *peer) {
 			peer->out->pos = 0;
 		}
                 cr_reset_hooks(peer);
+#ifdef UWSGI_SPDY
+		struct http_session *hr = (struct http_session *) peer->session;
+		if (hr->spdy) {
+			if (hr->spdy_update_window) {
+				if (uwsgi_buffer_fix(peer->in, 16)) return -1;
+				peer->in->pos = 16;
+				spdy_window_update(peer->in->buf, hr->spdy_update_window, 8192);
+				peer->session->main_peer->out = peer->in;
+                        	peer->session->main_peer->out_pos = 0;
+				hr->spdy_update_window = 0;
+                        	cr_write_to_main(peer, hr->func_write);	
+				return 1;
+			}
+			return spdy_parse(peer->session->main_peer);
+		}
+#endif
+		
         }
 
         return len;
@@ -403,6 +436,15 @@ ssize_t hr_write(struct corerouter_peer *main_peer) {
         if (cr_write_complete(main_peer)) {
                 // reset the original read buffer
                 main_peer->out->pos = 0;
+		if (main_peer->session->wait_full_write) {
+			main_peer->session->wait_full_write = 0;
+			return 0;
+		}
+		if (main_peer->session->connect_peer_after_write) {
+			cr_connect(main_peer->session->connect_peer_after_write, hr_instance_connected);
+			main_peer->session->connect_peer_after_write = NULL;
+			return len;
+		}
                 cr_reset_hooks(main_peer);
         }
 
@@ -415,16 +457,8 @@ ssize_t hr_instance_connected(struct corerouter_peer* peer) {
 	
 	cr_peer_connected(peer, "hr_instance_connected()");
 
-        // fix modifiers
-        peer->out->buf[0] = peer->session->main_peer->modifier1;
-        peer->out->buf[3] = peer->session->main_peer->modifier2;
-	// fix pktsize
-	peer->out->buf[1] = (uint8_t) ((peer->out->pos-4) & 0xff);
-        peer->out->buf[2] = (uint8_t) (((peer->out->pos-4) >> 8) & 0xff);
-
 	// prepare for write
 	peer->out_pos = 0;
-
 
 #ifdef UWSGI_SSL
 	if (hr->websockets > 2 && hr->websocket_key_len > 0) {
@@ -434,20 +468,129 @@ ssize_t hr_instance_connected(struct corerouter_peer* peer) {
 		return 1;
 	}
 #endif
-	if (hr->send_expect_100) {
-	}
-
 	// change the write hook (we are already monitoring for write)
 	peer->hook_write = hr_instance_write;
 	// and directly call it (optimistic approach...)
         return hr_instance_write(peer);
 }
 
+// check if the response allows for keepalive
+int hr_check_response_keepalive(struct corerouter_peer *peer) {
+	struct http_session *hr = (struct http_session *) peer->session;
+	struct uwsgi_buffer *ub = peer->in;
+	size_t i;
+	for(i=0;i<ub->pos;i++) {
+                char c = ub->buf[i];
+                if (c == '\r' && (peer->r_parser_status == 0 || peer->r_parser_status == 2)) {
+                        peer->r_parser_status++;
+                }
+                else if (c == '\r') {
+                        peer->r_parser_status = 1;
+                }
+                else if (c == '\n' && peer->r_parser_status == 1) {
+                        peer->r_parser_status = 2;
+                }
+                // parsing done
+                else if (c == '\n' && peer->r_parser_status == 3) {
+			// end of headers
+			peer->r_parser_status = 4;
+			if (http_response_parse(hr, ub, i+1)) {
+				return -1;
+			}
+			return 0;
+		}
+                else {
+                        peer->r_parser_status = 0;
+                }
+        }
+
+	return 1;
+
+}
+
 // data from instance
 ssize_t hr_instance_read(struct corerouter_peer *peer) {
+        peer->in->limit = UMAX16;
+	if (uwsgi_buffer_ensure(peer->in, uwsgi.page_size)) return -1;
 	struct http_session *hr = (struct http_session *) peer->session;
         ssize_t len = cr_read(peer, "hr_instance_read()");
-        if (!len) return 0;
+        if (!len) {
+		if (hr->session.can_keepalive) {
+			peer->session->main_peer->disabled = 0;
+			hr->rnrn = 0;
+			hr->can_gzip = 0;
+			hr->has_gzip = 0;
+			if (uhttp.keepalive > 1) {
+				int orig_timeout = peer->session->corerouter->socket_timeout;
+				peer->session->corerouter->socket_timeout = uhttp.keepalive;
+				peer->session->main_peer->timeout = corerouter_reset_timeout(peer->session->corerouter, peer->session->main_peer);
+				peer->session->corerouter->socket_timeout = orig_timeout;
+			}
+		}
+		if (hr->force_chunked || hr->force_gzip) {
+			hr->force_chunked = 0;
+			if (!hr->last_chunked) {
+				hr->last_chunked = uwsgi_buffer_new(5);
+			}
+			if (hr->force_gzip) {
+				hr->force_gzip = 0;
+				size_t zlen = 0;
+				char *gzipped = uwsgi_deflate(&hr->z, NULL, 0, &zlen);
+				if (!gzipped) return -1;
+				if (uwsgi_buffer_append_chunked(hr->last_chunked, zlen)) {free(gzipped) ; return -1;}
+				if (uwsgi_buffer_append(hr->last_chunked, gzipped, zlen)) {free(gzipped) ; return -1;}
+				free(gzipped);
+				if (uwsgi_buffer_append(hr->last_chunked, "\r\n", 2)) return -1;
+				if (uwsgi_buffer_append_chunked(hr->last_chunked, 8)) return -1;
+				if (uwsgi_buffer_u32le(hr->last_chunked, hr->gzip_crc32)) return -1;
+				if (uwsgi_buffer_u32le(hr->last_chunked, hr->gzip_size)) return -1;
+				if (uwsgi_buffer_append(hr->last_chunked, "\r\n", 2)) return -1;
+			}
+			if (uwsgi_buffer_append(hr->last_chunked, "0\r\n\r\n", 5)) return -1;
+			peer->session->main_peer->out = hr->last_chunked;
+			peer->session->main_peer->out_pos = 0;
+			cr_write_to_main(peer, hr->func_write);
+			if (!hr->session.can_keepalive) {
+				hr->session.wait_full_write = 1;
+			}
+		}
+		else {
+			cr_reset_hooks(peer);
+		}
+		return 0;
+	}
+
+	// need to parse response headers
+	if (hr->session.can_keepalive || hr->can_gzip) {
+		if (peer->r_parser_status != 4) {
+			int ret = hr_check_response_keepalive(peer);
+			if (ret < 0) return -1;
+			if (ret > 0) {
+				return 1;
+			}
+		}
+#ifdef UWSGI_ZLIB
+		else if (hr->force_gzip) {
+			size_t zlen = 0;
+			char *gzipped = uwsgi_deflate(&hr->z, peer->in->buf, peer->in->pos, &zlen);
+			if (!gzipped) return -1;
+			hr->gzip_size += peer->in->pos;
+			uwsgi_crc32(&hr->gzip_crc32, peer->in->buf, peer->in->pos);
+			peer->in->pos = 0;
+			if (uwsgi_buffer_insert_chunked(peer->in, 0, zlen)) {free(gzipped); return -1;}
+			if (uwsgi_buffer_append(peer->in, gzipped, zlen)) {
+				free(gzipped);
+				return -1;
+			}
+			free(gzipped);
+			if (uwsgi_buffer_append(peer->in, "\r\n", 2)) return -1;
+		}
+#endif
+		else if (hr->force_chunked) {
+			if (uwsgi_buffer_insert_chunked(peer->in, 0, len)) return -1;
+			if (uwsgi_buffer_append(peer->in, "\r\n", 2)) return -1;
+		}
+	}
 
         // set the input buffer as the main output one
         peer->session->main_peer->out = peer->in;
@@ -506,7 +649,12 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 		else if (*ptr == '\n' && hr->rnrn == 3) {
 			hr->rnrn = 4;
 			hr->headers_size = j;
-			hr->remains = len - (j + 1);
+
+			// for security
+			if ((j+1) <= len) {
+				hr->remains = len - (j+1);
+			}
+
 			struct uwsgi_corerouter *ucr = main_peer->session->corerouter;
 
 			// create a new peer
@@ -521,8 +669,8 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 			if (new_peer->key_len == 0) return -1;
 
 #ifdef UWSGI_SSL
-			if (hr->force_ssl) {
-				//hr_send_force_https;
+			if (hr->force_https) {
+				if (hr_force_https(new_peer)) return -1;
 				break;
 			}
 #endif
@@ -534,7 +682,16 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
                 	if (new_peer->instance_address_len == 0)
                         	return -1;
 
+			uint16_t pktsize = new_peer->out->pos-4;
+        		// fix modifiers
+        		new_peer->out->buf[0] = new_peer->session->main_peer->modifier1;
+        		new_peer->out->buf[3] = new_peer->session->main_peer->modifier2;
+        		// fix pktsize
+        		new_peer->out->buf[1] = (uint8_t) (pktsize & 0xff);
+        		new_peer->out->buf[2] = (uint8_t) ((pktsize >> 8) & 0xff);
+
 			if (hr->remains > 0) {
+				hr->session.can_keepalive = 0;
 				if (hr->content_length < hr->remains) { 
 					hr->remains = hr->content_length;
 					hr->content_length = 0;
@@ -542,8 +699,19 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 				else {
 					hr->content_length -= hr->remains;
 				}
-				if (uwsgi_buffer_append(new_peer->out, main_peer->in->buf + hr->headers_size, hr->remains)) return -1;
+				if (uwsgi_buffer_append(new_peer->out, main_peer->in->buf + hr->headers_size + 1, hr->remains)) return -1;
 			}
+
+			if (hr->session.can_keepalive) {
+				main_peer->disabled = 1;
+				// stop reading from the client
+				if (uwsgi_cr_set_hooks(main_peer, NULL, NULL)) return -1;
+			}
+
+			if (hr->send_expect_100) {
+				if (hr_manage_expect_continue(new_peer)) return -1;	
+				break;
+        		}
 
                 	cr_connect(new_peer, hr_instance_connected);
 			break;
@@ -574,6 +742,16 @@ void hr_session_close(struct corerouter_session *cs) {
 	if (hr->path_info) {
 		free(hr->path_info);
 	}
+
+	if (hr->last_chunked) {
+		uwsgi_buffer_destroy(hr->last_chunked);
+	}
+
+#ifdef UWSGI_ZLIB
+	if (hr->z.next_in) {
+		deflateEnd(&hr->z);
+	}
+#endif
 }
 
 ssize_t hr_recv_stud4(struct corerouter_peer * main_peer) {
@@ -649,9 +827,6 @@ int http_alloc_session(struct uwsgi_corerouter *ucr, struct uwsgi_gateway_socket
 		case UWSGI_HTTP_SSL:
 			hr_setup_ssl(hr, ugs);
 			break;
-		case UWSGI_HTTP_FORCE_SSL:
-			uwsgi_cr_set_hooks(cs->main_peer, NULL, hr_send_force_https);
-			break;
 #endif
 		default:
 			uwsgi_cr_set_hooks(cs->main_peer, cs->main_peer->last_hook_read, NULL);
@@ -672,8 +847,10 @@ int http_init() {
 
 	uhttp.cr.session_size = sizeof(struct http_session);
 	uhttp.cr.alloc_session = http_alloc_session;
-	if (uhttp.cr.has_sockets && !uwsgi.sockets && !uwsgi_corerouter_has_backends(&uhttp.cr)) {
-		uwsgi_new_socket(uwsgi_concat2("127.0.0.1:0", ""));
+	if (uhttp.cr.has_sockets && !uwsgi_corerouter_has_backends(&uhttp.cr)) {
+		if (!uwsgi.sockets) {
+			uwsgi_new_socket(uwsgi_concat2("127.0.0.1:0", ""));
+		}
 		uhttp.cr.use_socket = 1;
 		uhttp.cr.socket_num = 0;
 	}

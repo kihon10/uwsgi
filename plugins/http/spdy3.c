@@ -263,6 +263,37 @@ static void spdy_reply_header(char *buf, uint32_t len, uint32_t stream_id) {
 
 }
 
+// be sure to have at least 16 free bytes
+void spdy_window_update(char *buf, uint32_t stream_id, uint32_t wsize) {
+        buf[0] = 0x80;
+        buf[1] = 0x03;
+        buf[2] = 0;
+        buf[3] = 0x09;
+
+        // flags
+        buf[4] = 0;
+
+	uint32_t len = 8;
+
+        // length
+        buf[7] = (uint8_t) (len & 0xff);
+        buf[6] = (uint8_t) ((len >> 8) & 0xff);
+        buf[5] = (uint8_t) ((len >> 16) & 0xff);
+
+        // stream id
+        buf[11] = (uint8_t) (stream_id & 0xff);
+        buf[10] = (uint8_t) ((stream_id >> 8) & 0xff);
+        buf[9] = (uint8_t) ((stream_id >> 16) & 0xff);
+        buf[8] = (uint8_t) ((stream_id >> 24) & 0xff);
+
+        buf[15] = (uint8_t) (wsize & 0xff);
+        buf[14] = (uint8_t) ((wsize >> 8) & 0xff);
+        buf[13] = (uint8_t) ((wsize >> 16) & 0xff);
+        buf[12] = (uint8_t) ((wsize >> 24) & 0xff);
+
+}
+
+
 static ssize_t http_parse_to_spdy(struct corerouter_peer *peer) {
 	size_t i;
 	struct uwsgi_buffer *ub = peer->in;
@@ -492,6 +523,14 @@ static ssize_t spdy_inflate_http_headers(struct http_session *hr) {
                 return -1; 
         }
 
+	uint16_t pktsize = new_peer->out->pos-4;
+        // fix modifiers
+        new_peer->out->buf[0] = new_peer->session->main_peer->modifier1;
+        new_peer->out->buf[3] = new_peer->session->main_peer->modifier2;
+        // fix pktsize
+        new_peer->out->buf[1] = (uint8_t) (pktsize & 0xff);
+        new_peer->out->buf[2] = (uint8_t) ((pktsize >> 8) & 0xff);
+
 	cr_connect(new_peer, hr_instance_connected);
 
 	return 1;
@@ -575,7 +614,7 @@ ssize_t spdy_parse(struct corerouter_peer *main_peer) {
 		if (deflateSetDictionary(&hr->spdy_z_out, (Bytef *) SPDY_dictionary_txt, sizeof(SPDY_dictionary_txt)) != Z_OK) {
             		return -1;
             	}
-		hr->session.refcnt++;
+		cs->can_keepalive = 1;
 		hr->spdy_initialized = 1;
 
 		hr->spdy_phase = UWSGI_SPDY_PHASE_HEADER;
@@ -588,12 +627,10 @@ ssize_t spdy_parse(struct corerouter_peer *main_peer) {
 		return 1;
 	}
 
-
 	for(;;) {
 		size_t len = main_peer->in->pos;
 		if (len == 0) {
-			errno = EINPROGRESS;
-			return -1;
+			return 1;
 		}
 		uint8_t *buf = (uint8_t *) main_peer->in->buf;
 		//uwsgi_log("%d bytes available\n", len);
@@ -608,18 +645,19 @@ ssize_t spdy_parse(struct corerouter_peer *main_peer) {
 						hr->spdy_control_length = spdy_h_read_length(buf);
 						hr->spdy_phase = UWSGI_SPDY_PHASE_CONTROL;
 						hr->spdy_need = hr->spdy_control_length;
-						//uwsgi_log("now i need %d bytes for type %u\n", hr->spdy_need, hr->spdy_control_type);
+						//uwsgi_log("now i need %llu bytes for type %u\n", (unsigned long long) hr->spdy_need, hr->spdy_control_type);
 					}
 					else {
-						uwsgi_log("OOOOPS\n");
 						hr->spdy_phase = UWSGI_SPDY_PHASE_DATA;
-						hr->spdy_need = 1;
+						hr->spdy_data_stream_id = spdy_stream_id(buf);
+						hr->spdy_control_length = spdy_h_read_length(buf);
+						hr->spdy_need = hr->spdy_control_length;
+						//uwsgi_log("need %llu bytes for stream_id %lu\n", (unsigned long long) hr->spdy_need, hr->spdy_data_stream_id);
 					}
 					if (uwsgi_buffer_decapitate(main_peer->in, 8)) return -1;
 					continue;
 				}
-				errno = EINPROGRESS;
-				return -1;
+				return 1;
 			case UWSGI_SPDY_PHASE_CONTROL:
 				if (len >= hr->spdy_need) {
 					switch(hr->spdy_control_type) {
@@ -627,11 +665,13 @@ ssize_t spdy_parse(struct corerouter_peer *main_peer) {
 						case 1:
 							ret = spdy_manage_syn_stream(hr);
 							if (ret == 0) goto goon;
+							if (ret < 0) return -1;
 							goto newframe;
 						// RST_STREAM
 						case 3:
 							ret = spdy_manage_rst_stream(hr);
 							if (ret == 0) goto goon;
+							if (ret < 0) return -1;
 							goto newframe;
 						case 4:
 							//uwsgi_log("settings request...\n");
@@ -639,6 +679,7 @@ ssize_t spdy_parse(struct corerouter_peer *main_peer) {
 						case 6:
 							ret = spdy_manage_ping(hr);
                                                         if (ret == 0) goto goon;
+							if (ret < 0) return -1;
                                                         goto newframe;
 							break;
 						default:
@@ -651,15 +692,23 @@ goon:
 					if (uwsgi_buffer_decapitate(main_peer->in, hr->spdy_control_length)) return -1;
 					continue;
 				}
-				errno = EINPROGRESS;
-				return -1;
+				return 1;
 			case UWSGI_SPDY_PHASE_DATA:
 				if (len >= hr->spdy_need) {
-					//peer = find_stream_id();
-					//cr_write_to_backend(peer, spdy_data);
+					struct corerouter_peer *peer = uwsgi_cr_peer_find_by_sid(&hr->session, hr->spdy_data_stream_id);
+					if (!peer) {
+						return -1;
+					}
+
+					peer->out->pos = 0;
+					if (uwsgi_buffer_append(peer->out, main_peer->in->buf, hr->spdy_need)) return -1;
+                			peer->out_pos = 0;
+					hr->spdy_update_window = hr->spdy_data_stream_id;
+                			cr_write_to_backend(peer, hr_instance_write);
+					ret = 1;
+					goto newframe;
 				}
-				errno = EINPROGRESS;
-				return -1;
+				return 1;
 			default:
 				return -1;
 		}

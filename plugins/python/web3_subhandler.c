@@ -164,18 +164,13 @@ int uwsgi_response_subhandler_web3(struct wsgi_request *wsgi_req) {
 				goto clear; 
 			} 
 
-			// send the headers if not already sent
-        		if (!wsgi_req->headers_sent && wsgi_req->headers_hvec > 0) {
-                		uwsgi_python_do_send_headers(wsgi_req);
-        		}
-
 			Py_DECREF(spit_args);
 
 			if (PyString_Check((PyObject *)wsgi_req->async_placeholder)) {
 				char *content = PyString_AsString(wsgi_req->async_placeholder);
 				size_t content_len = PyString_Size(wsgi_req->async_placeholder);
 				UWSGI_RELEASE_GIL
-                		wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, content, content_len);
+				uwsgi_response_write_body_do(wsgi_req, content, content_len);
 				UWSGI_GET_GIL
 				uwsgi_py_check_write_errors {
                         		uwsgi_py_write_exception(wsgi_req);
@@ -218,7 +213,7 @@ int uwsgi_response_subhandler_web3(struct wsgi_request *wsgi_req) {
 		char *content = PyString_AsString(pychunk);
 		size_t content_len = PyString_Size(pychunk);
 		UWSGI_RELEASE_GIL
-		wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, content, content_len);
+		uwsgi_response_write_body_do(wsgi_req, content, content_len);
 		UWSGI_GET_GIL
 		uwsgi_py_check_write_errors {
 			uwsgi_py_write_exception(wsgi_req);

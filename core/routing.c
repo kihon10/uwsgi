@@ -2,8 +2,6 @@
 #include "uwsgi.h"
 
 extern struct uwsgi_server uwsgi;
-// http status codes list
-extern struct http_status_codes hsc[];
 
 static int uwsgi_apply_routes_do(struct wsgi_request *wsgi_req) {
 
@@ -129,6 +127,10 @@ void uwsgi_opt_add_route(char *opt, char *value, void *foobar) {
 		ur->subject = offsetof(struct wsgi_request, user_agent);
 		ur->subject_len = offsetof(struct wsgi_request, user_agent_len);
 	}
+	else if (!strcmp(foobar, "referer")) {
+		ur->subject = offsetof(struct wsgi_request, referer);
+		ur->subject_len = offsetof(struct wsgi_request, referer_len);
+	}
 	else if (!strcmp(foobar, "remote_user")) {
 		ur->subject = offsetof(struct wsgi_request, remote_user);
 		ur->subject_len = offsetof(struct wsgi_request, remote_user_len);
@@ -196,39 +198,13 @@ static int uwsgi_router_continue(struct uwsgi_route *ur, char *arg) {
 
 static int uwsgi_router_break_func(struct wsgi_request *wsgi_req, struct uwsgi_route *route) {
 	if (route->data_len >= 3) {
-		wsgi_req->status = route->custom;
-		if (wsgi_req->headers_size == 0 && wsgi_req->response_size == 0) {
-			char *msg = NULL;
-			size_t msg_len = 0;
-			if (route->data_len < 5) {
-				struct http_status_codes *http_sc;
-				for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
-                        		if (!memcmp(http_sc->key, route->data, 3)) {
-                                		msg = (char *) http_sc->message;
-                                		msg_len = http_sc->message_size;
-                                		break;
-                        		}
-				}
-			}
-			else {
-				msg = route->data + 4;
-				msg_len = route->data_len -4;
-			}
-			struct uwsgi_buffer *ub = uwsgi_buffer_new(4096);
-			if (uwsgi_buffer_append(ub, "HTTP/1.0 ", 9)) goto end;
-			if (uwsgi_buffer_append(ub, route->data, 3)) goto end;
-			if (msg && msg_len) {
-				if (uwsgi_buffer_append(ub, " ", 1)) goto end;
-				if (uwsgi_buffer_append(ub, msg, msg_len)) goto end;
-			}
-
-			if (uwsgi_buffer_append(ub, "\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n", 49)) goto end;
-			wsgi_req->headers_size = wsgi_req->socket->proto_write_header(wsgi_req, ub->buf, ub->pos);
-			wsgi_req->response_size = wsgi_req->socket->proto_write(wsgi_req, msg, msg_len);
-end:
-			uwsgi_buffer_destroy(ub);
-		}
+		if (uwsgi_response_prepare_headers(wsgi_req, route->data, route->data_len)) goto end;
+		if (uwsgi_response_add_connection_close(wsgi_req)) goto end;
+		if (uwsgi_response_add_content_type(wsgi_req, "text/plain", 10)) goto end;
+		// no need to check for return value
+		uwsgi_response_write_headers_do(wsgi_req);
 	}
+end:
 	return UWSGI_ROUTE_BREAK;	
 }
 
@@ -236,14 +212,6 @@ static int uwsgi_router_break(struct uwsgi_route *ur, char *arg) {
 	ur->func = uwsgi_router_break_func;
 	ur->data = arg;
         ur->data_len = strlen(arg);
-	if (ur->data_len >=3 ) {
-		// filling http status codes
-		struct http_status_codes *http_sc;
-        	for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
-                	http_sc->message_size = strlen(http_sc->message);
-        	}
-		ur->custom = uwsgi_str3_num(ur->data);
-	}
 	return 0;
 }
 
@@ -275,6 +243,34 @@ static int uwsgi_router_log(struct uwsgi_route *ur, char *arg) {
 	ur->data_len = strlen(arg);
 	return 0;
 }
+
+// logvar route
+static int uwsgi_router_logvar_func(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+
+        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
+        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
+
+        char *logline = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data2, ur->data2_len, ur->ovector, ur->ovn);
+	uwsgi_logvar_add(wsgi_req, ur->data, ur->data_len, logline, strlen(logline));
+        free(logline);
+
+        return UWSGI_ROUTE_NEXT;
+}
+
+static int uwsgi_router_logvar(struct uwsgi_route *ur, char *arg) {
+        ur->func = uwsgi_router_logvar_func;
+	char *equal = strchr(arg, '=');
+	if (!equal) {
+		uwsgi_log("invalid logvar syntax, must be key=value\n");
+		exit(1);
+	}
+        ur->data = arg;
+        ur->data_len = equal-arg;
+	ur->data2 = equal+1;
+	ur->data2_len = strlen(ur->data2);
+        return 0;
+}
+
 
 // goto route 
 
@@ -347,6 +343,28 @@ static int uwsgi_router_addheader(struct uwsgi_route *ur, char *arg) {
         return 0;
 }
 
+// remheader route
+static int uwsgi_router_remheader_func(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+
+        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
+        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
+
+        char *value = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data, ur->data_len, ur->ovector, ur->ovn);
+        uint16_t value_len = strlen(value);
+        uwsgi_remove_header(wsgi_req, value, value_len);
+        free(value);
+        return UWSGI_ROUTE_NEXT;
+}
+
+
+static int uwsgi_router_remheader(struct uwsgi_route *ur, char *arg) {
+        ur->func = uwsgi_router_remheader_func;
+        ur->data = arg;
+        ur->data_len = strlen(arg);
+        return 0;
+}
+
+
 
 // signal route
 static int uwsgi_router_signal_func(struct wsgi_request *wsgi_req, struct uwsgi_route *route) {
@@ -360,7 +378,25 @@ static int uwsgi_router_signal(struct uwsgi_route *ur, char *arg) {
 }
 
 
-
+// send route
+static int uwsgi_router_send_func(struct wsgi_request *wsgi_req, struct uwsgi_route *route) {
+	uwsgi_response_write_body_do(wsgi_req, route->data, route->data_len);
+	if (route->custom) {
+		uwsgi_response_write_body_do(wsgi_req, "\r\n", 2);
+	}
+        return UWSGI_ROUTE_NEXT;
+}
+static int uwsgi_router_send(struct uwsgi_route *ur, char *arg) {
+        ur->func = uwsgi_router_send_func;
+	ur->data = arg;
+	ur->data_len = strlen(arg);
+        return 0;
+}
+static int uwsgi_router_send_crnl(struct uwsgi_route *ur, char *arg) {
+	uwsgi_router_send(ur, arg);
+        ur->custom = 1;
+        return 0;
+}
 
 
 // register embedded routers
@@ -370,10 +406,15 @@ void uwsgi_register_embedded_routers() {
         uwsgi_register_router("break", uwsgi_router_break);
         uwsgi_register_router("goon", uwsgi_router_goon);
         uwsgi_register_router("log", uwsgi_router_log);
+        uwsgi_register_router("logvar", uwsgi_router_logvar);
         uwsgi_register_router("goto", uwsgi_router_goto);
         uwsgi_register_router("addvar", uwsgi_router_addvar);
         uwsgi_register_router("addheader", uwsgi_router_addheader);
+        uwsgi_register_router("delheader", uwsgi_router_remheader);
+        uwsgi_register_router("remheader", uwsgi_router_remheader);
         uwsgi_register_router("signal", uwsgi_router_signal);
+        uwsgi_register_router("send", uwsgi_router_send);
+        uwsgi_register_router("send-crnl", uwsgi_router_send_crnl);
 }
 
 struct uwsgi_router *uwsgi_register_router(char *name, int (*func) (struct uwsgi_route *, char *)) {

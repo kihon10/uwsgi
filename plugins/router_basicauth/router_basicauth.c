@@ -61,18 +61,6 @@ static uint16_t htpasswd_check(char *filename, char *auth) {
 
 int uwsgi_routing_func_basicauth(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 
-        struct iovec iov[4];
-
-        if (wsgi_req->protocol_len > 0) {
-        	iov[0].iov_base = wsgi_req->protocol;
-        	iov[0].iov_len = wsgi_req->protocol_len;
-	}
-	else {
-        	iov[0].iov_base = "HTTP/1.0";
-        	iov[0].iov_len = 8;
-	}
-
-	// check for "Basic =" string at least
 	if (wsgi_req->authorization_len > 7 && ur->data2_len > 0) {
 		if (strncmp(wsgi_req->authorization, "Basic ", 6))
 			goto forbidden;
@@ -112,21 +100,13 @@ int uwsgi_routing_func_basicauth(struct wsgi_request *wsgi_req, struct uwsgi_rou
 	}
 
 forbidden:
-        iov[1].iov_base = " 401 Authorization Required\r\nWWW-Authenticate: Basic realm=\"";
-        iov[1].iov_len = 60 ;
-
-	iov[2].iov_base = ur->data;
-	iov[2].iov_len = ur->data_len;
-
-	iov[3].iov_base = "\"\r\n\r\n";
-	iov[3].iov_len = 5;
-
-        wsgi_req->headers_size = wsgi_req->socket->proto_writev_header(wsgi_req, iov, 4);
-
-	wsgi_req->response_size = wsgi_req->socket->proto_write(wsgi_req,"Unauthorized", 12);
-
-	wsgi_req->status = 401;
-
+	if (uwsgi_response_prepare_headers(wsgi_req, "401 Authorization Required", 26)) goto end;
+	char *realm = uwsgi_concat3n("Basic realm=\"", 13, ur->data, ur->data_len, "\"", 1);
+	int ret = uwsgi_response_add_header(wsgi_req, "WWW-Authenticate", 16, realm, 13 + ur->data_len + 1);
+	free(realm);
+	if (ret) goto end;
+	uwsgi_response_write_body_do(wsgi_req, "Unauthorized", 12);
+end:
 	return UWSGI_ROUTE_BREAK;
 }
 

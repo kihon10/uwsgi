@@ -8,6 +8,11 @@
 #include <perl.h>
 #include "XSUB.h"
 
+#define uwsgi_pl_check_write_errors if (wsgi_req->write_errors > 0 && uwsgi.write_errors_exception_only) {\
+                        croak("error writing to client");\
+                }\
+                else if (wsgi_req->write_errors > uwsgi.write_errors_tolerance)\
+
 
 struct uwsgi_perl {
 
@@ -37,6 +42,9 @@ struct uwsgi_perl {
 
 	CV **tmp_psgix_logger;
 	CV **tmp_stream_responder;
+	
+	SV *postfork;
+	SV *atexit;
 };
 
 void init_perl_embedded_module(void);
@@ -52,3 +60,4 @@ int uwsgi_perl_obj_isa(SV *, char *);
 int init_psgi_app(struct wsgi_request *, char *, uint16_t, PerlInterpreter **);
 PerlInterpreter *uwsgi_perl_new_interpreter(void);
 int uwsgi_perl_mule(char *);
+void uwsgi_perl_run_hook(SV *);

@@ -944,6 +944,7 @@ struct uwsgi_socket *uwsgi_new_socket(char *name) {
 			char *auto_port = uwsgi_num2str(ntohs(sin.sin_port));
 			char *auto_ip = inet_ntoa(sin.sin_addr);
 			uwsgi_sock->name = uwsgi_concat3n(auto_ip, strlen(auto_ip), ":", 1, auto_port, strlen(auto_port));
+			free(auto_port);
 		}
 	}
 
@@ -1560,9 +1561,7 @@ void uwsgi_setup_shared_sockets() {
 						}
 						shared_sock->fd = i;
 					}
-					else {
-						free(sock);
-					}
+					free(sock);
 				}
 			}
 		}
@@ -1781,6 +1780,7 @@ void uwsgi_bind_sockets() {
 }
 
 void uwsgi_set_sockets_protocols() {
+
 	struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
 	while (uwsgi_sock) {
 		char *requested_protocol = uwsgi_sock->proto_name;
@@ -1802,6 +1802,7 @@ void uwsgi_set_sockets_protocols() {
 			}
 		}
 
+
 setup_proto:
 		if (!requested_protocol) {
 			requested_protocol = uwsgi.protocol;
@@ -1810,11 +1811,12 @@ setup_proto:
 		if (requested_protocol && !strcmp("http", requested_protocol)) {
 			uwsgi_sock->proto = uwsgi_proto_http_parser;
 			uwsgi_sock->proto_accept = uwsgi_proto_base_accept;
-			uwsgi_sock->proto_write = uwsgi_proto_uwsgi_write;
-			uwsgi_sock->proto_writev = uwsgi_proto_uwsgi_writev;
-			uwsgi_sock->proto_write_header = uwsgi_proto_uwsgi_write_header;
-			uwsgi_sock->proto_writev_header = uwsgi_proto_uwsgi_writev_header;
-			uwsgi_sock->proto_sendfile = NULL;
+			uwsgi_sock->proto_prepare_headers = uwsgi_proto_base_prepare_headers;
+                        uwsgi_sock->proto_add_header = uwsgi_proto_base_add_header;
+                        uwsgi_sock->proto_fix_headers = uwsgi_proto_base_fix_headers;
+                        uwsgi_sock->proto_write = uwsgi_proto_base_write;
+                        uwsgi_sock->proto_write_headers = uwsgi_proto_base_write;
+                        uwsgi_sock->proto_sendfile = uwsgi_proto_base_sendfile;
 			uwsgi_sock->proto_close = uwsgi_proto_base_close;
 			if (uwsgi.offload_threads > 0)
 				uwsgi_sock->can_offload = 1;
@@ -1826,10 +1828,8 @@ setup_proto:
 			uwsgi_sock->proto = uwsgi_proto_fastcgi_parser;
 			uwsgi_sock->proto_accept = uwsgi_proto_base_accept;
 			uwsgi_sock->proto_write = uwsgi_proto_fastcgi_write;
-			uwsgi_sock->proto_writev = uwsgi_proto_fastcgi_writev;
-			uwsgi_sock->proto_write_header = uwsgi_proto_fastcgi_write_header;
-			uwsgi_sock->proto_writev_header = uwsgi_proto_fastcgi_writev_header;
-			uwsgi_sock->proto_sendfile = uwsgi_proto_fastcgi_sendfile;
+			//uwsgi_sock->proto_write_header = uwsgi_proto_fastcgi_write_header;
+			//uwsgi_sock->proto_sendfile = uwsgi_proto_fastcgi_sendfile;
 			uwsgi_sock->proto_close = uwsgi_proto_fastcgi_close;
 		}
 #ifdef UWSGI_ZEROMQ
@@ -1840,11 +1840,12 @@ setup_proto:
 		else {
 			uwsgi_sock->proto = uwsgi_proto_uwsgi_parser;
 			uwsgi_sock->proto_accept = uwsgi_proto_base_accept;
-			uwsgi_sock->proto_write = uwsgi_proto_uwsgi_write;
-			uwsgi_sock->proto_writev = uwsgi_proto_uwsgi_writev;
-			uwsgi_sock->proto_write_header = uwsgi_proto_uwsgi_write_header;
-			uwsgi_sock->proto_writev_header = uwsgi_proto_uwsgi_writev_header;
-			uwsgi_sock->proto_sendfile = NULL;
+			uwsgi_sock->proto_prepare_headers = uwsgi_proto_base_prepare_headers;
+			uwsgi_sock->proto_add_header = uwsgi_proto_base_add_header;
+			uwsgi_sock->proto_fix_headers = uwsgi_proto_base_fix_headers;
+			uwsgi_sock->proto_write = uwsgi_proto_base_write;
+			uwsgi_sock->proto_write_headers = uwsgi_proto_base_write;
+			uwsgi_sock->proto_sendfile = uwsgi_proto_base_sendfile;
 			uwsgi_sock->proto_close = uwsgi_proto_base_close;
 			if (uwsgi.offload_threads > 0)
 				uwsgi_sock->can_offload = 1;

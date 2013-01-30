@@ -2,7 +2,7 @@
 
  *** uWSGI ***
 
- Copyright (C) 2009-2012 Unbit S.a.s. <info@unbit.it>
+ Copyright (C) 2009-2013 Unbit S.a.s. <info@unbit.it>
 
  This program is free software; you can redistribute it and/or
  modify it under the terms of the GNU General Public License
@@ -21,7 +21,7 @@
 */
 
 
-#include "uwsgi.h"
+#include <uwsgi.h>
 
 struct uwsgi_server uwsgi;
 
@@ -141,6 +141,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"need-app", no_argument, 0, "exit if no app can be loaded", uwsgi_opt_true, &uwsgi.need_app, 0},
 	{"master", no_argument, 'M', "enable master process", uwsgi_opt_true, &uwsgi.master_process, 0},
 	{"emperor", required_argument, 0, "run the Emperor", uwsgi_opt_add_string_list, &uwsgi.emperor, 0},
+	{"emperor-procname", required_argument, 0, "set the Emperor process name", uwsgi_opt_set_str, &uwsgi.emperor_procname, 0},
 	{"emperor-freq", required_argument, 0, "set the Emperor scan frequency (default 3 seconds)", uwsgi_opt_set_int, &uwsgi.emperor_freq, 0},
 	{"emperor-required-heartbeat", required_argument, 0, "set the Emperor tolerance about heartbeats", uwsgi_opt_set_int, &uwsgi.emperor_heartbeat, 0},
 	{"emperor-pidfile", required_argument, 0, "write the Emperor pid in the specified file", uwsgi_opt_set_str, &uwsgi.emperor_pidfile, 0},
@@ -160,7 +161,8 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"vassal-sos-backlog", required_argument, 0, "ask emperor for sos if backlog queue has more items than the value specified", uwsgi_opt_set_int, &uwsgi.vassal_sos_backlog, 0},
 	{"heartbeat", required_argument, 0, "announce healtness to the emperor", uwsgi_opt_set_int, &uwsgi.heartbeat, 0},
 	{"auto-snapshot", optional_argument, 0, "automatically make workers snaphost after reload", uwsgi_opt_set_int, &uwsgi.auto_snapshot, UWSGI_OPT_LAZY},
-	{"reload-mercy", required_argument, 0, "set the maximum time (in seconds) a worker can take to reload/shutdown", uwsgi_opt_set_int, &uwsgi.reload_mercy, 0},
+	{"reload-mercy", required_argument, 0, "set the maximum time (in seconds) we wait for workers and other processes to die during reload/shutdown", uwsgi_opt_set_int, &uwsgi.reload_mercy, 0},
+	{"worker-reload-mercy", required_argument, 0, "set the maximum time (in seconds) a worker can take to reload/shutdown (default is 60)", uwsgi_opt_set_int, &uwsgi.worker_reload_mercy, 0},
 	{"exit-on-reload", no_argument, 0, "force exit even if a reload is requested", uwsgi_opt_true, &uwsgi.exit_on_reload, 0},
 	{"die-on-term", no_argument, 0, "exit instead of brutal reload on SIGTERM", uwsgi_opt_true, &uwsgi.die_on_term, 0},
 	{"help", no_argument, 'h', "show this help", uwsgi_help, NULL, UWSGI_OPT_IMMEDIATE},
@@ -168,6 +170,8 @@ static struct uwsgi_option uwsgi_base_options[] = {
 
 	{"reaper", no_argument, 'r', "call waitpid(-1,...) after each request to get rid of zombies", uwsgi_opt_dyn_true, (void *) UWSGI_OPTION_REAPER, 0},
 	{"max-requests", required_argument, 'R', "reload workers after the specified amount of managed requests", uwsgi_opt_set_dyn, (void *) UWSGI_OPTION_MAX_REQUESTS, 0},
+	{"min-worker-lifetime", required_argument, 0, "number of seconds worker must run before being reloaded (default is 60)", uwsgi_opt_set_dyn, (void *) UWSGI_OPTION_MIN_WORKER_LIFETIME, 0},
+	{"max-worker-lifetime", required_argument, 0, "reload workers after the specified amount of seconds (default is disabled)", uwsgi_opt_set_dyn, (void *) UWSGI_OPTION_MAX_WORKER_LIFETIME, 0},
 
 	{"socket-timeout", required_argument, 'z', "set internal sockets timeout", uwsgi_opt_set_dyn, (void *) UWSGI_OPTION_SOCKET_TIMEOUT, 0},
 	{"no-fd-passing", no_argument, 0, "disable file descriptor passing", uwsgi_opt_true, &uwsgi.no_fd_passing, 0},
@@ -176,8 +180,8 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"ftok", required_argument, 0, "set the ipcsem key via ftok() for avoiding duplicates", uwsgi_opt_set_str, &uwsgi.ftok, 0},
 	{"sharedarea", required_argument, 'A', "create a raw shared memory area of specified pages", uwsgi_opt_set_int, &uwsgi.sharedareasize, 0},
 
-	{"cache", required_argument, 0, "create a shared cache containing given elements", uwsgi_opt_set_int, &uwsgi.cache_max_items, 0},
-	{"cache-blocksize", required_argument, 0, "set cache blocksize", uwsgi_opt_set_int, &uwsgi.cache_blocksize, 0},
+	{"cache", required_argument, 0, "create a shared cache containing given elements", uwsgi_opt_set_64bit, &uwsgi.cache_max_items, 0},
+	{"cache-blocksize", required_argument, 0, "set cache blocksize", uwsgi_opt_set_64bit, &uwsgi.cache_blocksize, 0},
 	{"cache-store", required_argument, 0, "enable persistent cache to disk", uwsgi_opt_set_str, &uwsgi.cache_store, UWSGI_OPT_MASTER},
 	{"cache-store-sync", required_argument, 0, "set frequency of sync for persistent cache", uwsgi_opt_set_int, &uwsgi.cache_store_sync, 0},
 	{"cache-server", required_argument, 0, "enable the threaded cache server", uwsgi_opt_set_str, &uwsgi.cache_server, 0},
@@ -188,6 +192,11 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"cache-udp-server", required_argument, 0, "bind the cache udp server (used only for set/update/delete) to the specified socket", uwsgi_opt_add_string_list, &uwsgi.cache_udp_server, UWSGI_OPT_MASTER},
 	{"cache-udp-node", required_argument, 0, "send cache update/deletion to the specified cache udp server", uwsgi_opt_add_string_list, &uwsgi.cache_udp_node, UWSGI_OPT_MASTER},
 	{"cache-sync", required_argument, 0, "copy the whole content of another uWSGI cache server on server startup", uwsgi_opt_set_str, &uwsgi.cache_sync, 0},
+
+	{"load-file-in-cache", required_argument, 0, "load a static file in the cache", uwsgi_opt_add_string_list, &uwsgi.load_file_in_cache, 0},
+
+	{"cache2", required_argument, 0, "create a new generation shared cache (keyval syntax)", uwsgi_opt_add_string_list, &uwsgi.cache2, 0},
+
 
 	{"queue", required_argument, 0, "enable shared queue", uwsgi_opt_set_int, &uwsgi.queue_size, 0},
 	{"queue-blocksize", required_argument, 0, "set queue blocksize", uwsgi_opt_set_int, &uwsgi.queue_store_sync, 0},
@@ -360,11 +369,14 @@ static struct uwsgi_option uwsgi_base_options[] = {
 #endif
 #ifdef UWSGI_SSL
 	{"ssl-verbose", no_argument, 0, "be verbose about SSL errors", uwsgi_opt_true, &uwsgi.ssl_verbose, 0},
-	{"ssl-sessions-use-cache", no_argument, 0, "use uWSGI cache for ssl sessions storage", uwsgi_opt_true, &uwsgi.ssl_sessions_use_cache, 0},
-	{"ssl-session-use-cache", no_argument, 0, "use uWSGI cache for ssl sessions storage", uwsgi_opt_true, &uwsgi.ssl_sessions_use_cache, 0},
+	// force master, as ssl sessions caching initialize locking early
+	{"ssl-sessions-use-cache", optional_argument, 0, "use uWSGI cache for ssl sessions storage", uwsgi_opt_set_str, &uwsgi.ssl_sessions_use_cache, UWSGI_OPT_MASTER},
+	{"ssl-session-use-cache", no_argument, 0, "use uWSGI cache for ssl sessions storage", uwsgi_opt_true, &uwsgi.ssl_sessions_use_cache, UWSGI_OPT_MASTER},
 	{"ssl-sessions-timeout", required_argument, 0, "set SSL sessions timeout (default: 300 seconds)", uwsgi_opt_set_int, &uwsgi.ssl_sessions_timeout, 0},
 	{"ssl-session-timeout", required_argument, 0, "set SSL sessions timeout (default: 300 seconds)", uwsgi_opt_set_int, &uwsgi.ssl_sessions_timeout, 0},
 	{"sni", required_argument, 0, "add an SNI-governed SSL context", uwsgi_opt_sni, NULL, 0},
+	{"sni-dir", required_argument, 0, "check for cert/key/client_ca file in the specified directory and create a sni/ssl context on demand", uwsgi_opt_set_str, &uwsgi.sni_dir, 0},
+	{"sni-dir-ciphers", required_argument, 0, "set ssl ciphers for sni-dir option", uwsgi_opt_set_str, &uwsgi.sni_dir_ciphers, 0},
 #ifdef UWSGI_PCRE
 	{"sni-regexp", required_argument, 0, "add an SNI-governed SSL context (the key is a regexp)", uwsgi_opt_sni, NULL, 0},
 #endif
@@ -390,6 +402,8 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"logfile-chmod", required_argument, 0, "chmod logfiles", uwsgi_opt_logfile_chmod, NULL, 0},
 	{"log-syslog", optional_argument, 0, "log to syslog", uwsgi_opt_set_logger, "syslog", UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
 	{"log-socket", required_argument, 0, "send logs to the specified socket", uwsgi_opt_set_logger, "socket", UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
+	{"req-logger", required_argument, 0, "set/append a request logger", uwsgi_opt_set_req_logger, NULL, UWSGI_OPT_REQ_LOG_MASTER},
+	{"logger-req", required_argument, 0, "set/append a request logger", uwsgi_opt_set_req_logger, NULL, UWSGI_OPT_REQ_LOG_MASTER},
 	{"logger", required_argument, 0, "set/append a logger", uwsgi_opt_set_logger, NULL, UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
 	{"logger-list", no_argument, 0, "list enabled loggers", uwsgi_opt_true, &uwsgi.loggers_list, 0},
 	{"loggers-list", no_argument, 0, "list enabled loggers", uwsgi_opt_true, &uwsgi.loggers_list, 0},
@@ -398,6 +412,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"log-drain", required_argument, 0, "drain (do not show) log lines matching the specified regexp", uwsgi_opt_add_regexp_list, &uwsgi.log_drain_rules, UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
 	{"log-filter", required_argument, 0, "show only log lines matching the specified regexp", uwsgi_opt_add_regexp_list, &uwsgi.log_filter_rules, UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
 	{"log-route", required_argument, 0, "log to the specified named logger if regexp applied on logline matches", uwsgi_opt_add_regexp_custom_list, &uwsgi.log_route, UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
+	{"log-req-route", required_argument, 0, "log requests to the specified named logger if regexp applied on logline matches", uwsgi_opt_add_regexp_custom_list, &uwsgi.log_req_route, UWSGI_OPT_REQ_LOG_MASTER},
 #endif
 #ifdef UWSGI_ALARM
 	{"alarm", required_argument, 0, "create a new alarm, syntax: <alarm> <plugin:args>", uwsgi_opt_add_string_list, &uwsgi.alarm_list, UWSGI_OPT_MASTER | UWSGI_OPT_LOG_MASTER},
@@ -465,8 +480,9 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"route-uri", required_argument, 0, "add a route based on REQUEST_URI", uwsgi_opt_add_route, "request_uri", 0},
 	{"route-qs", required_argument, 0, "add a route based on QUERY_STRING", uwsgi_opt_add_route, "query_string", 0},
 	{"route-remote-addr", required_argument, 0, "add a route based on REMOTE_ADDR", uwsgi_opt_add_route, "remote_addr", 0},
-	{"route-user-agent", required_argument, 0, "add a route based on USER_AGENT", uwsgi_opt_add_route, "user_agent", 0},
+	{"route-user-agent", required_argument, 0, "add a route based on HTTP_USER_AGENT", uwsgi_opt_add_route, "user_agent", 0},
 	{"route-remote-user", required_argument, 0, "add a route based on REMOTE_USER", uwsgi_opt_add_route, "remote_user", 0},
+	{"route-referer", required_argument, 0, "add a route based on HTTP_REFERER", uwsgi_opt_add_route, "referer", 0},
 	{"router-list", no_argument, 0, "list enabled routers", uwsgi_opt_true, &uwsgi.router_list, 0},
 	{"routers-list", no_argument, 0, "list enabled routers", uwsgi_opt_true, &uwsgi.router_list, 0},
 #endif
@@ -480,12 +496,16 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"websockets-max-size", required_argument, 0, "set the max allowed size of websocket messages (in Kbytes, default 1024)", uwsgi_opt_set_64bit, &uwsgi.websockets_max_size, 0},
 	{"websocket-max-size", required_argument, 0, "set the max allowed size of websocket messages (in Kbytes, default 1024)", uwsgi_opt_set_64bit, &uwsgi.websockets_max_size, 0},
 
+	{"channel", required_argument, 0, "create a named channel for cores messaging", uwsgi_opt_add_string_list, &uwsgi.channels_list, UWSGI_OPT_MASTER},
+
 	{"clock", required_argument, 0, "set a clock source", uwsgi_opt_set_str, &uwsgi.requested_clock, 0},
 
 	{"clock-list", no_argument, 0, "list enabled clocks", uwsgi_opt_true, &uwsgi.clock_list, 0},
 	{"clocks-list", no_argument, 0, "list enabled clocks", uwsgi_opt_true, &uwsgi.clock_list, 0},
 
 	{"add-header", required_argument, 0, "automatically add HTTP headers to response", uwsgi_opt_add_string_list, &uwsgi.additional_headers, 0},
+	{"rem-header", required_argument, 0, "automatically remove specified HTTP header from the response", uwsgi_opt_add_string_list, &uwsgi.remove_headers, 0},
+	{"del-header", required_argument, 0, "automatically remove specified HTTP header from the response", uwsgi_opt_add_string_list, &uwsgi.remove_headers, 0},
 
 	{"check-static", required_argument, 0, "check for static files in the specified directory", uwsgi_opt_check_static, NULL, UWSGI_OPT_MIME},
 	{"check-static-docroot", no_argument, 0, "check for static files in the requested DOCUMENT_ROOT", uwsgi_opt_true, &uwsgi.check_static_docroot, UWSGI_OPT_MIME},
@@ -496,6 +516,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"static-index", required_argument, 0, "search for specified file if a directory is requested", uwsgi_opt_add_string_list, &uwsgi.static_index, UWSGI_OPT_MIME},
 	{"static-safe", required_argument, 0, "skip security checks if the file is under the specified path", uwsgi_opt_add_string_list, &uwsgi.static_safe, UWSGI_OPT_MIME},
 	{"static-cache-paths", required_argument, 0, "put resolved paths in the uWSGI cache for the specified amount of seconds", uwsgi_opt_set_int, &uwsgi.static_cache_paths, UWSGI_OPT_MIME|UWSGI_OPT_MASTER},
+	{"static-cache-paths-name", required_argument, 0, "use the specified cache for static paths", uwsgi_opt_set_str, &uwsgi.static_cache_paths_name, UWSGI_OPT_MIME|UWSGI_OPT_MASTER},
 	{"mimefile", required_argument, 0, "set mime types file path (default /etc/mime.types)", uwsgi_opt_add_string_list, &uwsgi.mime_file, UWSGI_OPT_MIME},
 	{"mime-file", required_argument, 0, "set mime types file path (default /etc/mime.types)", uwsgi_opt_add_string_list, &uwsgi.mime_file, UWSGI_OPT_MIME},
 
@@ -519,7 +540,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"file-serve-mode", required_argument, 0, "set static file serving mode", uwsgi_opt_fileserve_mode, NULL, UWSGI_OPT_MIME},
 	{"fileserve-mode", required_argument, 0, "set static file serving mode", uwsgi_opt_fileserve_mode, NULL, UWSGI_OPT_MIME},
 
-	{"check-cache", no_argument, 0, "check for response data in the cache", uwsgi_opt_true, &uwsgi.check_cache, 0},
+	{"check-cache", optional_argument, 0, "check for response data in the specified cache (empty for default cache)", uwsgi_opt_set_str, &uwsgi.use_check_cache, 0},
 	{"close-on-exec", no_argument, 0, "set close-on-exec on sockets (could be required for spawning processes in requests)", uwsgi_opt_true, &uwsgi.close_on_exec, 0},
 	{"mode", required_argument, 0, "set uWSGI custom mode", uwsgi_opt_set_str, &uwsgi.mode, 0},
 	{"env", required_argument, 0, "set environment variable", uwsgi_opt_set_env, NULL, 0},
@@ -901,6 +922,7 @@ void simple_goodbye_cruel_world() {
 }
 
 void goodbye_cruel_world() {
+	uwsgi.workers[uwsgi.mywid].stopped_at = uwsgi_now();
 
 	if (!uwsgi.gbcw_hook) {
 		simple_goodbye_cruel_world();
@@ -1345,7 +1367,7 @@ static void vacuum(void) {
 
 void signal_pidfile(int sig, char *filename) {
 
-	int size = 0;
+	size_t size = 0;
 
 	char *buffer = uwsgi_open_and_read(filename, &size, 1, NULL);
 
@@ -2279,14 +2301,14 @@ int uwsgi_start(void *v_argv) {
 		uwsgi_init_queue();
 	}
 
-	// setup cache
-	if (uwsgi.cache_max_items > 0) {
-		uwsgi_init_cache();
-	}
+	uwsgi_cache_create_all();
 
-	// create the cache server
-	if (uwsgi.master_process && uwsgi.cache_server) {
-		uwsgi.cache_server_fd = uwsgi_cache_server(uwsgi.cache_server, uwsgi.cache_server_threads);
+	if (uwsgi.use_check_cache) {
+		uwsgi.check_cache = uwsgi_cache_by_name(uwsgi.use_check_cache);
+		if (!uwsgi.check_cache) {
+			uwsgi_log("unable to find cache \"%s\"\n", uwsgi.use_check_cache);
+			exit(1);
+		}
 	}
 
 	/* plugin initialization */
@@ -2687,6 +2709,9 @@ next2:
 		uwsgi.signal_socket = uwsgi.shared->worker_signal_pipe[1];
 	}
 
+	// setup channels
+	uwsgi_channels_init();
+
 	// uWSGI is ready
 	uwsgi_notify_ready();
 	uwsgi.current_time = uwsgi_now();
@@ -2949,8 +2974,8 @@ wait_for_call_of_duty:
 	if (uwsgi.snapshot) {
 		uwsgi_ignition();
 	}
-	// never here
-	pthread_exit(NULL);
+	// end of the process...
+	end_me(0);
 }
 
 /*
@@ -3330,6 +3355,10 @@ void uwsgi_opt_dyn_false(char *opt, char *value, void *key) {
 
 void uwsgi_opt_set_str(char *opt, char *value, void *key) {
 	char **ptr = (char **) key;
+	if (!value) {
+		*ptr = "";
+		return;	
+	}
 	*ptr = (char *) value;
 }
 
@@ -3343,6 +3372,19 @@ void uwsgi_opt_set_logger(char *opt, char *value, void *prefix) {
 	}
 	else {
 		uwsgi_string_new_list(&uwsgi.requested_logger, uwsgi_str(value));
+	}
+}
+
+void uwsgi_opt_set_req_logger(char *opt, char *value, void *prefix) {
+
+	if (!value)
+		value = "";
+
+	if (prefix) {
+		uwsgi_string_new_list(&uwsgi.requested_req_logger, uwsgi_concat3((char *) prefix, ":", value));
+	}
+	else {
+		uwsgi_string_new_list(&uwsgi.requested_req_logger, uwsgi_str(value));
 	}
 }
 
@@ -3385,61 +3427,6 @@ void uwsgi_opt_add_string_list_custom(char *opt, char *value, void *list) {
 	struct uwsgi_string_list *usl = uwsgi_string_new_list(ptr, value);
 	usl->custom = 1;
 }
-
-#ifdef UWSGI_SSL
-void uwsgi_opt_sni(char *opt, char *value, void *foobar) {
-	char *client_ca = NULL;
-	char *v = uwsgi_str(value);
-
-	char *space = strchr(v, ' ');
-	if (!space) {
-		uwsgi_log("invalid %s syntax, must be sni_key<space>crt,key[,ciphers,client_ca]\n", opt);
-		exit(1);
-	}
-	*space = 0;
-	char *crt = space+1;
-	char *key = strchr(crt, ',');
-        if (!key) {
-		uwsgi_log("invalid %s syntax, must be sni_key<space>crt,key[,ciphers,client_ca]\n", opt);
-                exit(1);
-        }
-        *key = '\0'; key++;
-
-        char *ciphers = strchr(key, ',');
-        if (ciphers) {
-                *ciphers = '\0'; ciphers++;
-                client_ca = strchr(ciphers, ',');
-                if (client_ca) {
-                        *client_ca = '\0'; client_ca++;
-                }
-        }
-
-	if (!uwsgi.ssl_initialized) {
-                uwsgi_ssl_init();
-        }
-
-	SSL_CTX *ctx = uwsgi_ssl_new_server_context(v, crt, key, ciphers, client_ca);
-	if (!ctx) {
-		uwsgi_log("[uwsgi-ssl] DANGER unable to initialize context for \"%s\"\n", v);
-		free(v);
-		return;
-	}
-
-#ifdef UWSGI_PCRE
-	if (!strcmp(opt, "sni-regexp")) {
-		struct uwsgi_regexp_list *url = uwsgi_regexp_new_list(&uwsgi.sni_regexp, v);
-		url->custom_ptr = ctx;
-	}
-	else {
-#endif
-		struct uwsgi_string_list *usl = uwsgi_string_new_list(&uwsgi.sni, v);
-		usl->custom_ptr = ctx;
-#ifdef UWSGI_PCRE
-	}
-#endif
-
-}
-#endif
 
 #ifdef UWSGI_PCRE
 void uwsgi_opt_add_regexp_list(char *opt, char *value, void *list) {
@@ -4014,7 +4001,7 @@ void uwsgi_opt_connect_and_read(char *opt, char *address, void *foobar) {
 	char buf[8192];
 
 	int fd = uwsgi_connect(address, -1, 0);
-	for (;;) {
+	while (fd >= 0) {
 		int ret = uwsgi_waitfd(fd, -1);
 		if (ret <= 0) {
 			exit(0);
@@ -4025,16 +4012,18 @@ void uwsgi_opt_connect_and_read(char *opt, char *address, void *foobar) {
 		}
 		uwsgi_log("%.*s", (int) len, buf);
 	}
+	uwsgi_error("uwsgi_connect()");
+	exit(1);
 }
 
 void uwsgi_opt_extract(char *opt, char *address, void *foobar) {
 
-	int len = 0;
+	size_t len = 0;
 	char *buf;
 
 	buf = uwsgi_open_and_read(address, &len, 0, NULL);
 	if (len > 0) {
-		if (write(1, buf, len) != len) {
+		if (write(1, buf, len) != (ssize_t) len) {
 			uwsgi_error("write()");
 			exit(1);
 		};

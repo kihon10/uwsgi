@@ -21,7 +21,12 @@ XS(XS_error) {
 
         psgi_check_args(0);
 
-        ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->error)[wsgi_req->async_id]);
+	if (uwsgi.threads > 1) {
+        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->error)[wsgi_req->async_id]);
+	}
+	else {
+        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->error)[0]);
+	}
         XSRETURN(1);
 }
 
@@ -32,7 +37,12 @@ XS(XS_input) {
 	struct uwsgi_app *wi = &uwsgi_apps[wsgi_req->app_id];
         psgi_check_args(0);
 
-        ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->input)[wsgi_req->async_id]);
+	if (uwsgi.threads > 1) {
+        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->input)[wsgi_req->async_id]);
+	}
+	else {
+        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->input)[0]);
+	}
         XSRETURN(1);
 }
 
@@ -66,7 +76,12 @@ XS(XS_stream)
 		while (psgi_response(wsgi_req, response) != UWSGI_OK);
 
 		SvREFCNT_dec(response);
-                ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->stream)[wsgi_req->async_id]);
+		if (uwsgi.threads > 1) {
+                	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->stream)[wsgi_req->async_id]);
+		}
+		else {
+                	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->stream)[0]);
+		}
                 XSRETURN(1);
 	}
 	else {
@@ -182,7 +197,10 @@ XS(XS_streaming_write) {
 
         body = SvPV(ST(1), blen);
 
-        wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, body, blen);
+	uwsgi_response_write_body_do(wsgi_req, body, blen);
+	uwsgi_pl_check_write_errors {
+		// noop
+	}
 
         XSRETURN(0);
 }

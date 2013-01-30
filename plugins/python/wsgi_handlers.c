@@ -296,13 +296,8 @@ PyObject *py_uwsgi_write(PyObject * self, PyObject * args) {
 	if (PyString_Check(data)) {
 		content = PyString_AsString(data);
 		content_len = PyString_Size(data);
-		if (content_len > 0 && !wsgi_req->headers_sent) {
-                        if (uwsgi_python_do_send_headers(wsgi_req)) {
-                                return NULL;
-                        }
-                }
 		UWSGI_RELEASE_GIL
-			wsgi_req->response_size = wsgi_req->socket->proto_write(wsgi_req, content, content_len);
+		uwsgi_response_write_body_do(wsgi_req, content, content_len);
 		UWSGI_GET_GIL
 		// this is a special case for the write callable
 		// no need to honout write-errors-exception-only
@@ -446,7 +441,8 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
 	}
 
 	if (wsgi_req->app_id == -1) {
-		internal_server_error(wsgi_req, "Python application not found");
+		uwsgi_500(wsgi_req);
+		uwsgi_log("--- no python application found, check your startup logs for errors ---\n");
 		goto clear2;
 	}
 
@@ -501,10 +497,8 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
 
 		// LOCK THIS PART
 
-		wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, wsgi_req->protocol, wsgi_req->protocol_len);
-		wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, " 500 Internal Server Error\r\n", 28 );
-		wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, "Content-type: text/plain\r\n\r\n", 28 );
-		wsgi_req->header_cnt = 1;
+		uwsgi_500(wsgi_req);
+		if (uwsgi_response_write_headers_do(wsgi_req)) goto clear;
 
 		/*
 		   sorry that is a hack to avoid the rewrite of PyErr_Print

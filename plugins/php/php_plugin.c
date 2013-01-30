@@ -10,9 +10,6 @@
 
 extern struct uwsgi_server uwsgi;
 
-// http status codes list
-extern struct http_status_codes hsc[];
-
 static sapi_module_struct uwsgi_sapi_module;
 
 struct uwsgi_php {
@@ -27,6 +24,7 @@ struct uwsgi_php {
 	char *docroot;
 	char *app;
 	char *app_qs;
+	char *fallback;
 	size_t ini_size;
 	int dump_config;
 	char *server_software;
@@ -53,6 +51,7 @@ struct uwsgi_option uwsgi_php_options[] = {
         {"php-server-software", required_argument, 0, "force php SERVER_SOFTWARE", uwsgi_opt_set_str, &uphp.server_software, 0},
         {"php-app", required_argument, 0, "force the php file to run at each request", uwsgi_opt_set_str, &uphp.app, 0},
         {"php-app-qs", required_argument, 0, "when in app mode force QUERY_STRING to the specified value + REQUEST_URI", uwsgi_opt_set_str, &uphp.app_qs, 0},
+        {"php-fallback", required_argument, 0, "run the specified php script when the request one does not exist", uwsgi_opt_set_str, &uphp.fallback, 0},
         {"php-app-bypass", required_argument, 0, "if the regexp matches the uri the --php-app is bypassed", uwsgi_opt_add_regexp_list, &uphp.app_bypass, 0},
         {"php-var", required_argument, 0, "add/overwrite a CGI variable at each request", uwsgi_opt_add_string_list, &uphp.vars, 0},
         {"php-dump-config", no_argument, 0, "dump php config (if modified via --php-set or append options)", uwsgi_opt_true, &uphp.dump_config, 0},
@@ -60,49 +59,12 @@ struct uwsgi_option uwsgi_php_options[] = {
 
 };
 
-void uwsgi_php_redirect_to_slash(struct wsgi_request *wsgi_req) {
-
-        struct iovec iov[6];
-
-        wsgi_req->status = 301;
-        iov[0].iov_base = wsgi_req->protocol;
-        iov[0].iov_len = wsgi_req->protocol_len;
-        iov[1].iov_base = " 301 Moved Permanently\r\n";
-        iov[1].iov_len = 24;
-        wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 2);
-
-        iov[0].iov_base = "Location: ";
-        iov[0].iov_len = 10;
-        iov[1].iov_base = wsgi_req->path_info;
-        iov[1].iov_len = wsgi_req->path_info_len;
-        iov[2].iov_base = "/";
-        iov[2].iov_len = 1;
-
-        if (wsgi_req->query_string_len > 0) {
-                iov[3].iov_base = "?";
-                iov[3].iov_len = 1;
-                iov[4].iov_base = wsgi_req->query_string;
-                iov[4].iov_len = wsgi_req->query_string_len;
-                iov[5].iov_base = "\r\n\r\n";
-                iov[5].iov_len = 4;
-                wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 6);
-                wsgi_req->header_cnt++;
-        }
-        else {
-                iov[3].iov_base = "\r\n\r\n";
-                iov[3].iov_len = 4;
-                wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 4);
-                wsgi_req->header_cnt++;
-        }
-}
-
-
 
 static int sapi_uwsgi_ub_write(const char *str, uint str_length TSRMLS_DC)
 {
 	struct wsgi_request *wsgi_req = (struct wsgi_request *) SG(server_context);
 
-	wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, (char *) str, str_length);
+	uwsgi_response_write_body_do(wsgi_req, (char *) str, str_length);
 	if (wsgi_req->write_errors > uwsgi.write_errors_tolerance) {
 		php_handle_aborted_connection();
 		return -1;
@@ -110,117 +72,35 @@ static int sapi_uwsgi_ub_write(const char *str, uint str_length TSRMLS_DC)
 	return str_length;
 }
 
-void uwsgi_php_404(struct wsgi_request *wsgi_req) {
-
-        wsgi_req->status = 404;
-        wsgi_req->headers_size += wsgi_req->socket->proto_write(wsgi_req, "HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found", 61);
-}
-
-void uwsgi_php_403(struct wsgi_request *wsgi_req) {
-
-        wsgi_req->status = 403;
-        wsgi_req->headers_size += wsgi_req->socket->proto_write(wsgi_req, "HTTP/1.0 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nForbidden", 61);
-
-}
-
-
 static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers)
 {
 	sapi_header_struct *h;
 	zend_llist_position pos;
-	struct iovec iov[6];
-	char status[4];
-	struct http_status_codes *http_sc;
 
 	if (SG(request_info).no_headers == 1) {
                 return SAPI_HEADER_SENT_SUCCESSFULLY;
         }
 
 	struct wsgi_request *wsgi_req = (struct wsgi_request *) SG(server_context);
-	wsgi_req->status = SG(sapi_headers).http_response_code;
-	if (!wsgi_req->status) wsgi_req->status = 200;
 
 	if (!SG(sapi_headers).http_status_line) {
-
-		iov[0].iov_base = wsgi_req->protocol;
-		iov[0].iov_len = wsgi_req->protocol_len;
-
-
-		iov[1].iov_base = " ";
-		iov[1].iov_len = 1;
-
-		uwsgi_num2str2n(wsgi_req->status, status, 4);
-
-		iov[2].iov_base = status;
-		iov[2].iov_len = 3;
-
-		iov[3].iov_base = " ";
-		iov[3].iov_len = 1;
-
-		// get the status code
-        	for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
-                	if (!strncmp(http_sc->key, status, 3)) {
-                        	iov[4].iov_base = (char *) http_sc->message;
-                        	iov[4].iov_len = http_sc->message_size;
-                        	break;
-                	}
-        	}
-
-        	if (iov[4].iov_len == 0) {
-                	iov[4].iov_base = "Unknown";
-                	iov[4].iov_len =  7;
-        	}
-
-		iov[5].iov_base = "\r\n";
-		iov[5].iov_len = 2;
-
-		wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 6);
+		char status[4];
+		int hrc = SG(sapi_headers).http_response_code;
+		if (!hrc) hrc = 200;
+		uwsgi_num2str2n(hrc, status, 4);
+		uwsgi_response_prepare_headers(wsgi_req, status, 3);
 	}
 	else {
-		iov[0].iov_base = SG(sapi_headers).http_status_line;
-		iov[0].iov_len = strlen(iov[0].iov_base);
-		iov[1].iov_base = "\r\n";
-		iov[1].iov_len = 2;
-		wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 2);
+		char *sl = SG(sapi_headers).http_status_line;
+		uwsgi_response_prepare_headers(wsgi_req, sl, strlen(sl));
 	}
 	
 	h = zend_llist_get_first_ex(&sapi_headers->headers, &pos);
 	while (h) {
-		iov[0].iov_base = h->header;
-		iov[0].iov_len = h->header_len;
-		iov[1].iov_base = "\r\n";
-		iov[1].iov_len = 2;
-
-		wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 2);	
-		wsgi_req->header_cnt++;
+		uwsgi_response_add_header(wsgi_req, NULL, 0, h->header, h->header_len);
 		h = zend_llist_get_next_ex(&sapi_headers->headers, &pos);
 	}
 
-	struct uwsgi_string_list *ah = uwsgi.additional_headers;
-        while(ah) {
-                        iov[0].iov_base = ah->value;
-                        iov[0].iov_len = ah->len;
-                        iov[1].iov_base = "\r\n";
-                        iov[1].iov_len = 2;
-                        wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 2);
-                        wsgi_req->header_cnt++;
-                        ah = ah->next;
-        }
-
-	ah = wsgi_req->additional_headers;
-        while(ah) {
-                        iov[0].iov_base = ah->value;
-                        iov[0].iov_len = ah->len;
-                        iov[1].iov_base = "\r\n";
-                        iov[1].iov_len = 2;
-                        wsgi_req->headers_size += wsgi_req->socket->proto_writev_header(wsgi_req, iov, 2);
-                        wsgi_req->header_cnt++;
-                        ah = ah->next;
-        }
-
-
-	wsgi_req->headers_size += wsgi_req->socket->proto_write_header(wsgi_req, "\r\n", 2);
-	
 	return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
 
@@ -343,7 +223,7 @@ static sapi_module_struct uwsgi_sapi_module;
 
 
 void uwsgi_php_append_config(char *filename) {
-	int file_size = 0;
+	size_t file_size = 0;
         char *file_content = uwsgi_open_and_read(filename, &file_size, 1, NULL);
 	uwsgi_sapi_module.ini_entries = realloc(uwsgi_sapi_module.ini_entries, uphp.ini_size + file_size);
 	memcpy(uwsgi_sapi_module.ini_entries + uphp.ini_size, file_content, file_size);
@@ -386,20 +266,20 @@ PHP_FUNCTION(uwsgi_cache_del) {
 	char *key = NULL;
         int keylen = 0;
 
-        if (!uwsgi.cache_max_items)
+        if (!uwsgi.caches)
                 RETURN_NULL();
 
         if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &key, &keylen) == FAILURE) {
                 RETURN_NULL();
         }
 
-	uwsgi_wlock(uwsgi.cache_lock);
+	uwsgi_wlock(uwsgi.caches->lock);
         if (uwsgi_cache_del(key, keylen, 0, 0)) {
-                uwsgi_rwunlock(uwsgi.cache_lock);
+                uwsgi_rwunlock(uwsgi.caches->lock);
 		RETURN_TRUE;
         }
 
-        uwsgi_rwunlock(uwsgi.cache_lock);
+        uwsgi_rwunlock(uwsgi.caches->lock);
 	RETURN_NULL();
 }
 
@@ -409,21 +289,21 @@ PHP_FUNCTION(uwsgi_cache_get) {
 	int keylen = 0;
 	uint64_t valsize;
 
-	if (!uwsgi.cache_max_items)
+	if (!uwsgi.caches)
 		RETURN_NULL();
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &key, &keylen) == FAILURE) {
                 RETURN_NULL();
         }
 
-	uwsgi_rlock(uwsgi.cache_lock);
+	uwsgi_rlock(uwsgi.caches->lock);
 	char *value = uwsgi_cache_get(key, keylen, &valsize);
 	if (value) {
 		char *ret = estrndup(value, valsize);
-		uwsgi_rwunlock(uwsgi.cache_lock);
+		uwsgi_rwunlock(uwsgi.caches->lock);
 		RETURN_STRING(ret, 0);
 	}
-	uwsgi_rwunlock(uwsgi.cache_lock);
+	uwsgi_rwunlock(uwsgi.caches->lock);
 	RETURN_NULL();
 }
 
@@ -434,23 +314,23 @@ PHP_FUNCTION(uwsgi_cache_set) {
 	int vallen;
 	uint64_t expires = 0;
 
-	if (!uwsgi.cache_max_items)
+	if (!uwsgi.caches)
 		RETURN_NULL();
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|l", &key, &keylen, &value, &vallen, &expires) == FAILURE) {
                 RETURN_NULL();
         }
 
-	if ((uint64_t)vallen > uwsgi.cache_blocksize) {
+	if ((uint64_t)vallen > uwsgi.caches->blocksize) {
 		RETURN_NULL();
 	}
 	
-	uwsgi_wlock(uwsgi.cache_lock);
+	uwsgi_wlock(uwsgi.caches->lock);
 	if (uwsgi_cache_set(key, keylen, value, vallen, expires, 0)) {
-		uwsgi_rwunlock(uwsgi.cache_lock);
+		uwsgi_rwunlock(uwsgi.caches->lock);
 		RETURN_TRUE;
 	}
-	uwsgi_rwunlock(uwsgi.cache_lock);
+	uwsgi_rwunlock(uwsgi.caches->lock);
 	RETURN_NULL();
 	
 }
@@ -462,23 +342,23 @@ PHP_FUNCTION(uwsgi_cache_update) {
         int vallen;
         uint64_t expires = 0;
 
-	if (!uwsgi.cache_max_items)
+	if (!uwsgi.caches)
 		RETURN_NULL();
 
         if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|l", &key, &keylen, &value, &vallen, &expires) == FAILURE) {
                 RETURN_NULL();
         }
 
-        if ((uint64_t)vallen > uwsgi.cache_blocksize) {
+        if ((uint64_t)vallen > uwsgi.caches->blocksize) {
                 RETURN_NULL();
         }
 
-        uwsgi_wlock(uwsgi.cache_lock);
+        uwsgi_wlock(uwsgi.caches->lock);
         if (uwsgi_cache_set(key, keylen, value, vallen, expires, UWSGI_CACHE_FLAG_UPDATE)) {
-                uwsgi_rwunlock(uwsgi.cache_lock);
+                uwsgi_rwunlock(uwsgi.caches->lock);
                 RETURN_TRUE;
         }
-        uwsgi_rwunlock(uwsgi.cache_lock);
+        uwsgi_rwunlock(uwsgi.caches->lock);
         RETURN_NULL();
 
 }
@@ -594,7 +474,7 @@ zend_function_entry uwsgi_php_functions[] = {
 PHP_MINFO_FUNCTION(uwsgi_php_minfo) {
 	php_info_print_table_start( );
 	php_info_print_table_row(2, "uwsgi api", "enabled");
-	if (uwsgi.cache_max_items > 0) {
+	if (uwsgi.caches) {
 		php_info_print_table_row(2, "uwsgi cache", "enabled");
 	}
 	else {
@@ -665,8 +545,6 @@ static sapi_module_struct uwsgi_sapi_module = {
 
 int uwsgi_php_init(void) {
 
-	struct http_status_codes *http_sc;
-
 	struct uwsgi_string_list *pset = uphp.set;
 	struct uwsgi_string_list *append_config = uphp.append_config;
 
@@ -700,11 +578,6 @@ int uwsgi_php_init(void) {
 
 	uwsgi_sapi_module.startup(&uwsgi_sapi_module);
 
-	// filling http status codes
-        for (http_sc = hsc; http_sc->message != NULL; http_sc++) {
-                http_sc->message_size = strlen(http_sc->message);
-        }
-
 	uwsgi_log("PHP %s initialized\n", PHP_VERSION);
 
 	return 0;
@@ -730,7 +603,6 @@ int uwsgi_php_walk(struct wsgi_request *wsgi_req, char *full_path, char *docroot
                         *(dst+part_size-1) = 0;
 
                         if (stat(full_path, &st)) {
-				uwsgi_php_404(wsgi_req);
                                 return -1;
                         }
 
@@ -740,7 +612,6 @@ int uwsgi_php_walk(struct wsgi_request *wsgi_req, char *full_path, char *docroot
                                 if (i < (wsgi_req->path_info_len)-1) {
                                         *path_info = ptr + i;
                                 }
-
                                 return 0;
                         }
 
@@ -847,8 +718,15 @@ oldstyle:
 
 	if (uwsgi_php_walk(wsgi_req, filename, wsgi_req->document_root, wsgi_req->document_root_len, &path_info)) {
 		free(filename);
-		return -1;
+		if (uphp.fallback) {
+			filename = uwsgi_str(uphp.fallback);
+		}
+		else {
+			uwsgi_404(wsgi_req);
+			return -1;
+		}
 	}
+
 
 	char *orig_path_info = wsgi_req->path_info;
 	uint16_t orig_path_info_len = wsgi_req->path_info_len;
@@ -865,7 +743,7 @@ oldstyle:
 
 	if (!realpath(filename, real_filename)) {
 		free(filename);
-		uwsgi_php_404(wsgi_req);
+		uwsgi_404(wsgi_req);
 		return -1;
 	}
 
@@ -880,7 +758,7 @@ oldstyle:
 			}
 			usl = usl->next;
 		}
-		uwsgi_php_403(wsgi_req);
+		uwsgi_403(wsgi_req);
 		uwsgi_log("PHP security error: %s is not under an allowed docroot\n", real_filename);
 		return -1;
 	}
@@ -888,7 +766,7 @@ oldstyle:
 secure:
 
 	if (stat(real_filename, &php_stat)) {
-                uwsgi_php_404(wsgi_req);
+                uwsgi_404(wsgi_req);
                 return UWSGI_OK;
         }
 
@@ -898,7 +776,7 @@ secure:
                 if (orig_path_info_len == 0 || (orig_path_info_len > 0 && orig_path_info[orig_path_info_len-1] != '/')) {
 			wsgi_req->path_info = orig_path_info;
 			wsgi_req->path_info_len = orig_path_info_len;
-                        uwsgi_php_redirect_to_slash(wsgi_req);
+                        uwsgi_redirect_to_slash(wsgi_req);
                         return UWSGI_OK;
                 }
                 struct uwsgi_string_list *upi = uphp.index;
@@ -919,7 +797,7 @@ secure:
                 }
 
                 if (!found) {
-                        uwsgi_php_404(wsgi_req);
+                        uwsgi_404(wsgi_req);
                         return UWSGI_OK;
                 }
 
@@ -938,7 +816,7 @@ secure:
 			}
                         usl = usl->next;
                 }
-                uwsgi_php_403(wsgi_req);
+                uwsgi_403(wsgi_req);
                 uwsgi_log("PHP security error: %s does not end with an allowed extension\n", real_filename);
                 return -1;
 	}
@@ -956,7 +834,7 @@ secure2:
                         }
                         usl = usl->next;
                 }
-                uwsgi_php_403(wsgi_req);
+                uwsgi_403(wsgi_req);
                 uwsgi_log("PHP security error: %s is not an allowed script\n", real_filename);
                 return -1;
         }
@@ -1001,7 +879,7 @@ secure3:
         file_handle.opened_path = NULL;
 
         if (php_request_startup(TSRMLS_C) == FAILURE) {
-		internal_server_error(wsgi_req, "unable to start php request");
+		uwsgi_500(wsgi_req);
                 return -1;
         }
 

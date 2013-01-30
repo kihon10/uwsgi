@@ -6,8 +6,9 @@ extern struct uwsgi_server uwsgi;
 
 #ifdef UWSGI_SSL
 #ifdef OPENSSL_NPN_UNSUPPORTED
+#ifdef UWSGI_ZLIB
 #define UWSGI_SPDY
-#include <zlib.h>
+#endif
 #endif
 #endif
 
@@ -17,10 +18,12 @@ struct uwsgi_http {
 
         uint8_t modifier1;
         struct uwsgi_string_list *http_vars;
-        int manage_expect;
+        uint64_t manage_expect;
 
         int raw_body;
         int keepalive;
+        int auto_chunked;
+        int auto_gzip;
 
 #ifdef UWSGI_SSL
         int websockets;
@@ -59,6 +62,8 @@ struct http_session {
         char *path_info;
         uint16_t path_info_len;
 
+	int force_chunked;
+
 #ifdef UWSGI_SSL
 	int websockets;
 	char *origin;
@@ -75,7 +80,7 @@ struct http_session {
         char *ssl_client_dn;
         BIO *ssl_bio;
         char *ssl_cc;
-        int force_ssl;
+        int force_https;
         struct uwsgi_buffer *force_ssl_buf;
 #endif
 
@@ -101,7 +106,18 @@ struct http_session {
 
 	struct uwsgi_buffer *spdy_ping;
 
+	uint32_t spdy_update_window;
+
         ssize_t (*spdy_hook)(struct corerouter_peer *);
+#endif
+
+#ifdef UWSGI_ZLIB
+	int can_gzip;
+	int has_gzip;
+	int force_gzip;
+	uint32_t gzip_crc32;
+	uint32_t gzip_size;
+	z_stream z;
 #endif
 
         int send_expect_100;
@@ -112,6 +128,8 @@ struct http_session {
         char stud_prefix[17];
         size_t stud_prefix_remains;
         size_t stud_prefix_pos;
+
+	struct uwsgi_buffer *last_chunked;
 
 	ssize_t (*func_write)(struct corerouter_peer *);
 
@@ -132,7 +150,7 @@ ssize_t hr_recv_http_ssl(struct corerouter_peer *);
 ssize_t hr_read_ssl_body(struct corerouter_peer *);
 ssize_t hr_write_ssl_response(struct corerouter_peer *);
 
-ssize_t hr_send_force_https(struct corerouter_peer *);
+int hr_force_https(struct corerouter_peer *);
 
 void hr_session_ssl_close(struct corerouter_session *);
 
@@ -149,11 +167,13 @@ int uwsgi_spdy_npn(SSL *ssl, const unsigned char **, unsigned int *, void *);
 void uwsgi_spdy_info_cb(SSL const *, int, int);
 ssize_t hr_recv_spdy_control_frame(struct corerouter_peer *);
 ssize_t spdy_parse(struct corerouter_peer *);
+void spdy_window_update(char *, uint32_t, uint32_t);
 #endif
 
 ssize_t hs_http_manage(struct corerouter_peer *, ssize_t);
 
 ssize_t hr_instance_connected(struct corerouter_peer *);
+ssize_t hr_instance_write(struct corerouter_peer *);
 
 ssize_t hr_instance_read_response(struct corerouter_peer *);
 ssize_t hr_read_body(struct corerouter_peer *);
@@ -161,3 +181,5 @@ ssize_t hr_write_body(struct corerouter_peer *);
 
 void hr_session_close(struct corerouter_session *);
 ssize_t http_parse(struct corerouter_peer *);
+
+int http_response_parse(struct http_session *, struct uwsgi_buffer *, size_t);

@@ -170,15 +170,13 @@ ssize_t uwsgi_proto_fastcgi_writev(struct wsgi_request * wsgi_req, struct iovec 
 	return uwsgi_proto_fastcgi_writev_header(wsgi_req, iovec, iov_len);
 }
 
-ssize_t uwsgi_proto_fastcgi_write(struct wsgi_request * wsgi_req, char *buf, size_t len) {
+int uwsgi_proto_fastcgi_write(struct wsgi_request * wsgi_req, char *buf, size_t len) {
+/*
 	struct fcgi_record fr;
-	ssize_t rlen;
-	size_t chunk_len;
-	char *ptr = buf;
 
-	// in fastcgi we need to not send 0 size frames
+	// in fastcgi we need to not send 0 sized frames
 	if (!len)
-		return 0;
+		return UWSGI_OK;
 
 	fr.version = 1;
 	fr.type = 6;
@@ -188,9 +186,27 @@ ssize_t uwsgi_proto_fastcgi_write(struct wsgi_request * wsgi_req, char *buf, siz
 	fr.reserved = 0;
 	fr.cl = htons(len);
 
-	// split response in 64k chunks...
+	// still trying to send the fcgi header ?
+	if (*written < 8) {
+		char *ptr = (char *) &fr;
+		ssize_t wlen = write(wsgi_req->poll.fd, ptr + *written, 8 - *written);
+		if (wlen > 0) {
+			*written += wlen;
+			if (*written == 8) {
+				goto body;
+			}
+			return UWSGI_AGAIN;
+		}
+		if (wlen < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+				return UWSGI_AGAIN;
+			}
+		}
+		return -1;
+	}
 
-	if (len <= 65535) {
+	// split response in 64k chunks...
+body:
 		rlen = write(wsgi_req->poll.fd, &fr, 8);
 		if (rlen <= 0) {
 			if (!uwsgi.ignore_write_errors) {
@@ -234,11 +250,9 @@ ssize_t uwsgi_proto_fastcgi_write(struct wsgi_request * wsgi_req, char *buf, siz
 		}
 		return ptr-buf;
 	}
+*/
+	return -1;
 
-}
-
-ssize_t uwsgi_proto_fastcgi_write_header(struct wsgi_request * wsgi_req, char *buf, size_t len) {
-	return uwsgi_proto_fastcgi_write(wsgi_req, buf, len);
 }
 
 void uwsgi_proto_fastcgi_close(struct wsgi_request *wsgi_req) {
@@ -250,9 +264,9 @@ void uwsgi_proto_fastcgi_close(struct wsgi_request *wsgi_req) {
 	uwsgi_proto_base_close(wsgi_req);
 }
 
-ssize_t uwsgi_proto_fastcgi_sendfile(struct wsgi_request *wsgi_req) {
+int uwsgi_proto_fastcgi_sendfile(struct wsgi_request *wsgi_req, int fd, size_t pos, size_t len) {
 
-	ssize_t len;
+/*
 	struct fcgi_record fr;
 	char buf[65536];
 	size_t remains = wsgi_req->sendfile_fd_size - wsgi_req->sendfile_fd_pos;
@@ -303,5 +317,7 @@ ssize_t uwsgi_proto_fastcgi_sendfile(struct wsgi_request *wsgi_req) {
 	}
 
 	return wsgi_req->sendfile_fd_pos;
+*/
+	return -1;
 
 }

@@ -57,8 +57,6 @@ struct corerouter_peer *uwsgi_cr_peer_add(struct corerouter_session *cs) {
 		cs->peers = peers;
 	}
 
-	cs->refcnt++;
-
 	return peers;
 }
 
@@ -279,8 +277,6 @@ void corerouter_manage_subscription(char *key, uint16_t keylen, char *val, uint1
 	}
 }
 
-static struct uwsgi_rb_timer *corerouter_reset_timeout(struct uwsgi_corerouter *, struct corerouter_peer *);
-
 void corerouter_close_peer(struct uwsgi_corerouter *ucr, struct corerouter_peer *peer) {
 	struct corerouter_session *cs = peer->session;
 
@@ -380,9 +376,7 @@ end:
 		corerouter_close_session(ucr, cs);
 	}
 	else {
-		if (cs->refcnt > 0)
-			cs->refcnt--;
-		if (cs->refcnt == 0) {
+		if (cs->can_keepalive == 0 && cs->wait_full_write == 0) {
 			corerouter_close_session(ucr, cs);
 		}
 	}
@@ -409,25 +403,37 @@ void corerouter_close_session(struct uwsgi_corerouter *ucr, struct corerouter_se
 		cr_session->close(cr_session);
 
 	free(cr_session);
+
+	if (ucr->active_sessions == 0) {
+		uwsgi_log("[BUG] number of active sessions already 0 !!!\n");
+		return;
+	}
+	ucr->active_sessions--;
 }
 
-static struct uwsgi_rb_timer *corerouter_reset_timeout(struct uwsgi_corerouter *ucr, struct corerouter_peer *peer) {
+struct uwsgi_rb_timer *corerouter_reset_timeout(struct uwsgi_corerouter *ucr, struct corerouter_peer *peer) {
 	cr_del_timeout(ucr, peer);
 	return cr_add_timeout(ucr, peer);
 }
 
-static void corerouter_expire_timeouts(struct uwsgi_corerouter *ucr) {
+struct uwsgi_rb_timer *corerouter_reset_timeout_fast(struct uwsgi_corerouter *ucr, struct corerouter_peer *peer, time_t now) {
+        cr_del_timeout(ucr, peer);
+        return cr_add_timeout_fast(ucr, peer, now);
+}
 
-	time_t current = uwsgi_now();
+
+static void corerouter_expire_timeouts(struct uwsgi_corerouter *ucr, time_t now) {
+
+	uint64_t current = (uint64_t) now;
 	struct uwsgi_rb_timer *urbt;
 	struct corerouter_peer *peer;
 
 	for (;;) {
-		urbt = uwsgi_min_rb_timer(ucr->timeouts);
+		urbt = uwsgi_min_rb_timer(ucr->timeouts, NULL);
 		if (urbt == NULL)
 			return;
 
-		if (urbt->key <= current) {
+		if (urbt->value <= current) {
 			peer = (struct corerouter_peer *) urbt->data;
 			peer->timed_out = 1;
 			if (peer->connecting) {
@@ -559,10 +565,11 @@ struct corerouter_session *corerouter_alloc_session(struct uwsgi_corerouter *ucr
 	// set initial timeout
         peer->timeout = cr_add_timeout(ucr, ucr->cr_table[new_connection]);
 
+	ucr->active_sessions++;
+
 	// here we prepare the real session and set the hooks
 	if (ucr->alloc_session(ucr, ugs, cs, cr_addr, cr_addr_len)) {
-		uwsgi_cr_peer_del(cs->main_peer);
-		free(cs);
+		corerouter_close_session(ucr, cs);
 		cs = NULL;
 	}
 
@@ -658,6 +665,10 @@ void uwsgi_corerouter_loop(int id, void *data) {
 	ucr->mapper = uwsgi_cr_map_use_void;
 
 			if (ucr->use_cache) {
+				ucr->cache = uwsgi_cache_by_name(ucr->use_cache);
+				if (!ucr->cache) {
+					uwsgi_log("unable to find cache \"%s\"\n", ucr->use_cache);
+				}
                         	ucr->mapper = uwsgi_cr_map_use_cache;
                         }
                         else if (ucr->pattern) {
@@ -690,15 +701,17 @@ void uwsgi_corerouter_loop(int id, void *data) {
 
 	for (;;) {
 
+		time_t now = uwsgi_now();
+
 		// set timeouts and harakiri
-		min_timeout = uwsgi_min_rb_timer(ucr->timeouts);
+		min_timeout = uwsgi_min_rb_timer(ucr->timeouts, NULL);
 		if (min_timeout == NULL) {
 			delta = -1;
 		}
 		else {
-			delta = min_timeout->key - uwsgi_now();
+			delta = min_timeout->value - now;
 			if (delta <= 0) {
-				corerouter_expire_timeouts(ucr);
+				corerouter_expire_timeouts(ucr, now);
 				delta = 0;
 			}
 		}
@@ -710,12 +723,14 @@ void uwsgi_corerouter_loop(int id, void *data) {
 		// wait for events
 		nevents = event_queue_wait_multi(ucr->queue, delta, events, ucr->nevents);
 
+		now = uwsgi_now();
+
 		if (uwsgi.master_process && ucr->harakiri > 0) {
-			ushared->gateways_harakiri[id] = uwsgi_now() + ucr->harakiri;
+			ushared->gateways_harakiri[id] = now + ucr->harakiri;
 		}
 
 		if (nevents == 0) {
-			corerouter_expire_timeouts(ucr);
+			corerouter_expire_timeouts(ucr, now);
 		}
 
 		for (i = 0; i < nevents; i++) {
@@ -791,8 +806,8 @@ void uwsgi_corerouter_loop(int id, void *data) {
 				}
 
 				// set timeout (in main_peer too)
-				peer->timeout = corerouter_reset_timeout(ucr, peer);
-				peer->session->main_peer->timeout = corerouter_reset_timeout(ucr, peer->session->main_peer);
+				peer->timeout = corerouter_reset_timeout_fast(ucr, peer, now);
+				peer->session->main_peer->timeout = corerouter_reset_timeout_fast(ucr, peer->session->main_peer, now);
 
 				ssize_t (*hook)(struct corerouter_peer *) = NULL;
 
@@ -815,6 +830,8 @@ void uwsgi_corerouter_loop(int id, void *data) {
 				}
 				else if (ret < 0) {
 					if (errno == EINPROGRESS) continue;
+					// remove keepalive on error
+					peer->session->can_keepalive = 0;
 					corerouter_close_peer(ucr, peer);
 					continue;
 				}
@@ -919,6 +936,8 @@ void corerouter_send_stats(struct uwsgi_corerouter *ucr) {
 
         char *cwd = uwsgi_get_cwd();
         if (uwsgi_stats_keyval_comma(us, "cwd", cwd)) goto end0;
+
+        if (uwsgi_stats_keylong_comma(us, "active_sessions", (unsigned long long) ucr->active_sessions)) goto end0;
 
 	if (uwsgi_stats_key(us , ucr->short_name)) goto end0;
         if (uwsgi_stats_list_open(us)) goto end0;

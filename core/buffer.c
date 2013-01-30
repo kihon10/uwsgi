@@ -48,9 +48,39 @@ int uwsgi_buffer_ensure(struct uwsgi_buffer *ub, size_t len) {
 	return 0;
 }
 
+int uwsgi_buffer_insert(struct uwsgi_buffer *ub, size_t pos, char *buf, size_t len) {
+	size_t to_move = (ub->pos-pos);
+	if (uwsgi_buffer_ensure(ub, len)) return -1;
+	memmove(ub->buf+pos+len, ub->buf+pos, to_move);
+	memcpy(ub->buf+pos, buf, len);
+	ub->pos += len;
+	return 0;
+}
+
+int uwsgi_buffer_insert_chunked(struct uwsgi_buffer *ub, size_t pos, size_t len) {
+	// 0xFFFFFFFFFFFFFFFF\r\n\0
+	char chunked[19];
+	int ret = snprintf(chunked, 19, "%X\r\n", (unsigned int) len);
+        if (ret <= 0 || ret > 19) {
+                return -1;
+        }
+	return uwsgi_buffer_insert(ub, pos, chunked, ret);
+}
+
+int uwsgi_buffer_append_chunked(struct uwsgi_buffer *ub, size_t len) {
+        // 0xFFFFFFFFFFFFFFFF\r\n\0
+        char chunked[19];
+        int ret = snprintf(chunked, 19, "%X\r\n", (unsigned int) len);
+        if (ret <= 0 || ret > 19) {
+                return -1;
+        }
+        return uwsgi_buffer_append(ub, chunked, ret);
+}
+
+
 int uwsgi_buffer_decapitate(struct uwsgi_buffer *ub, size_t len) {
 	if (len > ub->pos) return -1;
-	ub->buf = memmove(ub->buf, ub->buf + len, ub->pos-len);
+	memmove(ub->buf, ub->buf + len, ub->pos-len);
 	ub->pos = ub->pos-len;
 	return 0;
 }
@@ -119,6 +149,15 @@ int uwsgi_buffer_u32be(struct uwsgi_buffer *ub, uint32_t num) {
         buf[2] = (uint8_t) ((num >> 8) & 0xff);
         buf[1] = (uint8_t) ((num >> 16) & 0xff);
         buf[0] = (uint8_t) ((num >> 24) & 0xff);
+        return uwsgi_buffer_append(ub, (char *) buf, 4);
+}
+
+int uwsgi_buffer_u32le(struct uwsgi_buffer *ub, uint32_t num) {
+        uint8_t buf[4];
+        buf[0] = (uint8_t) (num & 0xff);
+        buf[1] = (uint8_t) ((num >> 8) & 0xff);
+        buf[2] = (uint8_t) ((num >> 16) & 0xff);
+        buf[3] = (uint8_t) ((num >> 24) & 0xff);
         return uwsgi_buffer_append(ub, (char *) buf, 4);
 }
 
@@ -206,6 +245,19 @@ void uwsgi_buffer_destroy(struct uwsgi_buffer *ub) {
 	if (ub->buf)
 		free(ub->buf);
 	free(ub);
+}
+
+ssize_t uwsgi_buffer_write_simple(struct wsgi_request *wsgi_req, struct uwsgi_buffer *ub) {
+	size_t remains = ub->pos;
+	while(remains) {
+		ssize_t len = write(wsgi_req->poll.fd, ub->buf + (ub->pos - remains), remains);
+		if (len <= 0) {
+			return len;
+		}
+		remains -= len;
+	}
+
+	return ub->pos;
 }
 
 int uwsgi_buffer_send(struct uwsgi_buffer *ub, int fd) {

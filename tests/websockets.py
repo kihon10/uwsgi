@@ -1,7 +1,12 @@
+#!./uwsgi --https :8443,foobar.crt,foobar.key --http-raw-body --gevent 100 --channel room001 --processes 4 --module tests.websocket
 import uwsgi
 import time
 
 def application(env, sr):
+
+    ws_scheme = 'ws'
+    if 'HTTPS' in env or env['wsgi.url_scheme'] == 'https':
+        ws_scheme = 'wss'
 
     if env['PATH_INFO'] == '/':
         sr('200 OK', [('Content-Type','text/html')])
@@ -9,7 +14,7 @@ def application(env, sr):
     <html>
       <head>
           <script language="Javascript">
-            var s = new WebSocket("ws://raring64.local:8181/foobar/");
+            var s = new WebSocket("%s://%s/foobar/");
             s.onopen = function() {
               alert("connected !!!");
               s.send("ciao");
@@ -38,14 +43,17 @@ def application(env, sr):
         <h1>WebSocket</h1>
         <input type="text" id="testo"/>
         <input type="button" value="invia" onClick="invia();"/>
-	<div id="blackboard" style="width:640px;height:480px;background-color:black;color:white;border: solid 2px red">
+	<div id="blackboard" style="width:640px;height:480px;background-color:black;color:white;border: solid 2px red;overflow:auto">
 	</div>
     </body>
     </html>
-        """
+        """ % (ws_scheme, env['HTTP_HOST'])
     elif env['PATH_INFO'] == '/foobar/':
+	uwsgi.websocket_handshake(env['HTTP_SEC_WEBSOCKET_KEY'], env.get('HTTP_ORIGIN', ''))
         print "websockets..."
+	uwsgi.websocket_channel_join('room001')
         while True:
             msg = uwsgi.websocket_recv()
             print len(msg)
-            uwsgi.websocket_send("hello %s = %s" % (time.time(), msg)) 
+            #uwsgi.websocket_send("hello %s = %s" % (time.time(), msg)) 
+            uwsgi.channel_send('room001', "channel %s = %s" % (time.time(), msg))
