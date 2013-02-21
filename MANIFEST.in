@@ -4,3 +4,10 @@ recursive-include core *
 recursive-include plugins *
 recursive-include proto *
 recursive-include lib *
+recursive-include apache2 *
+recursive-include cherokee *
+recursive-include contrib *
+recursive-include lighttpd *
+recursive-include nginx *
+recursive-include valgrind *
+recursive-include vassals *
