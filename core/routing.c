@@ -1,7 +1,78 @@
 #ifdef UWSGI_ROUTING
-#include "uwsgi.h"
+#include <uwsgi.h>
 
 extern struct uwsgi_server uwsgi;
+
+struct uwsgi_buffer *uwsgi_routing_translate(struct wsgi_request *wsgi_req, struct uwsgi_route *ur, char *subject, uint16_t subject_len, char *data, size_t data_len) {
+
+	// cannot fail
+	char *pass1 = uwsgi_regexp_apply_ovec(subject, subject_len, data, data_len, ur->ovector, ur->ovn);
+	size_t pass1_len = strlen(pass1);
+
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(pass1_len);
+	size_t i;
+	int status = 0;
+	char *key = NULL;
+	size_t keylen = 0;
+	for(i=0;i<pass1_len;i++) {
+		switch(status) {
+			case 0:
+				if (pass1[i] == '$') {
+					status = 1;
+					break;
+				}
+				if (uwsgi_buffer_append(ub, pass1 + i, 1)) goto error;
+				break;
+			case 1:
+				if (pass1[i] == '{') {
+					status = 2;
+					key = pass1+i+1;
+					keylen = 0;
+					break;
+				}
+				status = 0;
+				key = NULL;
+				keylen = 0;
+				if (uwsgi_buffer_append(ub, "$", 1)) goto error;
+				if (uwsgi_buffer_append(ub, pass1 + i, 1)) goto error;
+				break;
+			case 2:
+				if (pass1[i] == '}') {
+					uint16_t vallen = 0;
+					char *value = uwsgi_get_var(wsgi_req, key, keylen, &vallen);
+					if (value) {
+						if (uwsgi_buffer_append(ub, value, vallen)) goto error;
+					}
+                                        status = 0;
+					key = NULL;
+					keylen = 0;
+                                        break;
+                                }
+				keylen++;
+				break;
+			default:
+				break;
+		}
+	}
+
+	// fix the buffer
+	if (status == 1) {
+		if (uwsgi_buffer_append(ub, "$", 1)) goto error;
+	}
+	else if (status == 2) {
+		if (uwsgi_buffer_append(ub, "${", 2)) goto error;
+		if (keylen > 0) {
+			if (uwsgi_buffer_append(ub, key, keylen)) goto error;
+		}
+	}
+
+	free(pass1);
+	return ub;
+
+error:
+	uwsgi_buffer_destroy(ub);
+	return NULL;
+}
 
 static int uwsgi_apply_routes_do(struct wsgi_request *wsgi_req) {
 
@@ -81,6 +152,30 @@ int uwsgi_apply_routes_fast(struct wsgi_request *wsgi_req) {
 
 void uwsgi_opt_add_route(char *opt, char *value, void *foobar) {
 
+	struct uwsgi_route *old_ur = NULL,*ur = uwsgi.routes;
+	uint64_t pos = 0;
+	while(ur) {
+		old_ur = ur;
+		ur = ur->next;
+		pos++;
+	}
+	ur = uwsgi_calloc(sizeof(struct uwsgi_route));
+	if (old_ur) {
+		old_ur->next = ur;
+	}
+	else {
+		uwsgi.routes = ur;
+	}
+
+	ur->pos = pos;
+
+	// is it a label ?
+	if (foobar == NULL) {
+		ur->label = value;
+		ur->label_len = strlen(value);
+		return;
+	}
+
 	char *route = uwsgi_str(value);
 
 	char *space = strchr(route, ' ');
@@ -90,22 +185,6 @@ void uwsgi_opt_add_route(char *opt, char *value, void *foobar) {
 	}
 
 	*space = 0;
-
-	struct uwsgi_route *ur = uwsgi.routes;
-	if (!ur) {
-		uwsgi.routes = uwsgi_calloc(sizeof(struct uwsgi_route));
-		ur = uwsgi.routes;
-	}
-	else {
-		while (ur) {
-			if (!ur->next) {
-				ur->next = uwsgi_calloc(sizeof(struct uwsgi_route));
-				ur = ur->next;
-				break;
-			}
-			ur = ur->next;
-		}
-	}
 
 	if (!strcmp(foobar, "http_host")) {
 		ur->subject = offsetof(struct wsgi_request, host);
@@ -140,6 +219,9 @@ void uwsgi_opt_add_route(char *opt, char *value, void *foobar) {
 		ur->subject_len = offsetof(struct wsgi_request, path_info_len);
 	}
 
+	ur->subject_str = foobar;
+	ur->regexp = route;
+
 	if (uwsgi_regexp_build(route, &ur->pattern, &ur->pattern_extra)) {
 		exit(1);
 	}
@@ -150,6 +232,7 @@ void uwsgi_opt_add_route(char *opt, char *value, void *foobar) {
 	}
 
 	char *command = space + 1;
+	ur->action = uwsgi_str(command);
 
 	char *colon = strchr(command, ':');
 	if (!colon) {
@@ -230,10 +313,11 @@ static int uwsgi_router_log_func(struct wsgi_request *wsgi_req, struct uwsgi_rou
 	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
-        char *logline = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data, ur->data_len, ur->ovector, ur->ovn);
-	uwsgi_log("%s\n", logline);
-	free(logline);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
+	if (!ub) return UWSGI_ROUTE_BREAK;
 
+	uwsgi_log("%.*s\n", ub->pos, ub->buf);
+	uwsgi_buffer_destroy(ub);
 	return UWSGI_ROUTE_NEXT;	
 }
 
@@ -250,9 +334,10 @@ static int uwsgi_router_logvar_func(struct wsgi_request *wsgi_req, struct uwsgi_
         char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
-        char *logline = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data2, ur->data2_len, ur->ovector, ur->ovn);
-	uwsgi_logvar_add(wsgi_req, ur->data, ur->data_len, logline, strlen(logline));
-        free(logline);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data2, ur->data2_len);
+	if (!ub) return UWSGI_ROUTE_BREAK;
+	uwsgi_logvar_add(wsgi_req, ur->data, ur->data_len, ub->buf, ub->pos);
+	uwsgi_buffer_destroy(ub);
 
         return UWSGI_ROUTE_NEXT;
 }
@@ -274,17 +359,42 @@ static int uwsgi_router_logvar(struct uwsgi_route *ur, char *arg) {
 
 // goto route 
 
-static int uwsgi_router_goto_func(struct wsgi_request *wsgi_req, struct uwsgi_route *route) {
-	if (route->custom <= wsgi_req->route_pc) {
-		uwsgi_log("[uwsgi-route] ERROR \"goto\" instruction can only jump forward\n");
+static int uwsgi_router_goto_func(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+	// build the label (if needed)
+	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
+        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
+
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
+        if (!ub) return UWSGI_ROUTE_BREAK;
+
+	// find the label
+	struct uwsgi_route *routes = uwsgi.routes;
+	while(routes) {
+		if (!routes->label) goto next;
+		if (!uwsgi_strncmp(routes->label, routes->label_len, ub->buf, ub->pos)) {
+			wsgi_req->route_goto = routes->pos;
+			goto found;
+		}
+next:
+		routes = routes->next;
+	}
+
+	wsgi_req->route_goto = ur->custom;
+	
+found:
+	uwsgi_buffer_destroy(ub);
+	if (wsgi_req->route_goto <= wsgi_req->route_pc) {
+		wsgi_req->route_goto = 0;
+		uwsgi_log("[uwsgi-route] ERROR \"goto\" instruction can only jump forward (check your label !!!)\n");
 		return UWSGI_ROUTE_BREAK;
 	}
-	wsgi_req->route_goto = route->custom;
 	return UWSGI_ROUTE_NEXT;	
 }
 
 static int uwsgi_router_goto(struct uwsgi_route *ur, char *arg) {
 	ur->func = uwsgi_router_goto_func;
+	ur->data = arg;
+	ur->data_len = strlen(arg);
 	ur->custom = atoi(arg);
         return 0;
 }
@@ -295,14 +405,14 @@ static int uwsgi_router_addvar_func(struct wsgi_request *wsgi_req, struct uwsgi_
         char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
-        char *value = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data2, ur->data2_len, ur->ovector, ur->ovn);
-        uint16_t value_len = strlen(value);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data2, ur->data2_len);
+        if (!ub) return UWSGI_ROUTE_BREAK;
 
-	if (!uwsgi_req_append(wsgi_req, ur->data, ur->data_len, value, value_len)) {
-		free(value);
+	if (!uwsgi_req_append(wsgi_req, ur->data, ur->data_len, ub->buf, ub->pos)) {
+		uwsgi_buffer_destroy(ub);
         	return UWSGI_ROUTE_BREAK;
 	}
-	free(value);
+	uwsgi_buffer_destroy(ub);
         return UWSGI_ROUTE_NEXT;
 }
 
@@ -328,10 +438,10 @@ static int uwsgi_router_addheader_func(struct wsgi_request *wsgi_req, struct uws
         char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
-        char *value = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data, ur->data_len, ur->ovector, ur->ovn);
-        uint16_t value_len = strlen(value);
-	uwsgi_additional_header_add(wsgi_req, value, value_len);
-        free(value);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
+        if (!ub) return UWSGI_ROUTE_BREAK;
+	uwsgi_additional_header_add(wsgi_req, ub->buf, ub->pos);
+	uwsgi_buffer_destroy(ub);
         return UWSGI_ROUTE_NEXT;
 }
 
@@ -349,10 +459,10 @@ static int uwsgi_router_remheader_func(struct wsgi_request *wsgi_req, struct uws
         char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
-        char *value = uwsgi_regexp_apply_ovec(*subject, *subject_len, ur->data, ur->data_len, ur->ovector, ur->ovn);
-        uint16_t value_len = strlen(value);
-        uwsgi_remove_header(wsgi_req, value, value_len);
-        free(value);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
+        if (!ub) return UWSGI_ROUTE_BREAK;
+        uwsgi_remove_header(wsgi_req, ub->buf, ub->pos);
+	uwsgi_buffer_destroy(ub);
         return UWSGI_ROUTE_NEXT;
 }
 
@@ -439,5 +549,20 @@ struct uwsgi_router *uwsgi_register_router(char *name, int (*func) (struct uwsgi
 
 	return NULL;
 
+}
+
+void uwsgi_routing_dump() {
+	struct uwsgi_route *routes = uwsgi.routes;
+	uwsgi_log("*** dumping internal routing table ***\n");
+	while(routes) {
+		if (routes->label) {
+			uwsgi_log("[rule: %llu] label: %s\n", (unsigned long long ) routes->pos, routes->label);
+		}
+		else {
+			uwsgi_log("[rule: %llu] subject: %s regexp: %s action: %s\n", (unsigned long long ) routes->pos, routes->subject_str, routes->regexp, routes->action);
+		}
+		routes = routes->next;
+	}
+	uwsgi_log("*** end of the internal routing table ***\n");
 }
 #endif

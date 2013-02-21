@@ -87,15 +87,18 @@ void uwsgi_init_default() {
 	uwsgi.subscribe_freq = 10;
 	uwsgi.subscription_tolerance = 17;
 
-	uwsgi.cluster_fd = -1;
 	uwsgi.cores = 1;
 	uwsgi.threads = 1;
+
+	// default max number of rpc slot
+	uwsgi.rpc_max = 64;
 
 	uwsgi.offload_threads_events = 64;
 
 	uwsgi.default_app = -1;
 
 	uwsgi.buffer_size = 4096;
+	uwsgi.body_read_warning = 8;
 	uwsgi.numproc = 1;
 
 	uwsgi.forkbomb_delay = 2;
@@ -115,14 +118,14 @@ void uwsgi_init_default() {
 	uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT] = 4;
 	uwsgi.shared->options[UWSGI_OPTION_LOGGING] = 1;
 
-	uwsgi.shared->options[UWSGI_OPTION_MIN_WORKER_LIFETIME] = 60;
+	// a workers hould be running for at least 10 seconds
+	uwsgi.shared->options[UWSGI_OPTION_MIN_WORKER_LIFETIME] = 10;
 
-#ifdef UWSGI_SPOOLER
 	uwsgi.shared->spooler_frequency = 30;
 
 	uwsgi.shared->spooler_signal_pipe[0] = -1;
 	uwsgi.shared->spooler_signal_pipe[1] = -1;
-#endif
+
 	uwsgi.shared->mule_signal_pipe[0] = -1;
 	uwsgi.shared->mule_signal_pipe[1] = -1;
 
@@ -143,15 +146,13 @@ void uwsgi_init_default() {
 	uwsgi.ssl_sessions_timeout = 300;
 #endif
 
-#ifdef UWSGI_ALARM
 	uwsgi.alarm_freq = 3;
-#endif
+	uwsgi.alarm_msg_size = 8192;
 
+	uwsgi.exception_handler_msg_size = 65536;
 
-#ifdef UWSGI_MULTICAST
 	uwsgi.multicast_ttl = 1;
 	uwsgi.multicast_loop = 1;
-#endif
 
 	// filling http status codes
 	struct http_status_codes *http_sc;
@@ -159,8 +160,11 @@ void uwsgi_init_default() {
                 http_sc->message_size = strlen(http_sc->message);
         }
 
+	uwsgi.empty = "";
+
+	uwsgi.wait_read_hook = uwsgi_simple_wait_read_hook;
 	uwsgi.wait_write_hook = uwsgi_simple_wait_write_hook;
-	uwsgi.buffer_write_hook = uwsgi_buffer_write_simple;
+
 	uwsgi_websockets_init();
 }
 
@@ -304,7 +308,8 @@ void uwsgi_setup_workers() {
 
 		// this is a trick for avoiding too much memory areas
 		void *ts = uwsgi_calloc_shared(sizeof(void *) * uwsgi.max_apps * uwsgi.cores);
-		void *buffers = uwsgi_malloc_shared(uwsgi.buffer_size * uwsgi.cores);
+		// add 4 bytes for uwsgi header
+		void *buffers = uwsgi_malloc_shared((uwsgi.buffer_size+4) * uwsgi.cores);
 		void *hvec = uwsgi_malloc_shared(sizeof(struct iovec) * uwsgi.vec_size * uwsgi.cores);
 		void *post_buf = NULL;
 		if (uwsgi.post_buffering > 0)
@@ -314,8 +319,8 @@ void uwsgi_setup_workers() {
 		for (j = 0; j < uwsgi.cores; j++) {
 			// allocate shared memory for thread states (required for some language, like python)
 			uwsgi.workers[i].cores[j].ts = ts + ((sizeof(void *) * uwsgi.max_apps) * j);
-			// raw per-request buffer
-			uwsgi.workers[i].cores[j].buffer = buffers + (uwsgi.buffer_size * j);
+			// raw per-request buffer (+4 bytes for uwsgi header)
+			uwsgi.workers[i].cores[j].buffer = buffers + ((uwsgi.buffer_size+4) * j);
 			// iovec for uwsgi vars
 			uwsgi.workers[i].cores[j].hvec = hvec + ((sizeof(struct iovec) * uwsgi.vec_size) * j);
 			if (post_buf)
@@ -393,6 +398,7 @@ void sanitize_args() {
                 uwsgi.ignore_write_errors = 1;
         }
 
+        if (uwsgi.cheaper_count == 0) uwsgi.cheaper = 0;
 
         if (uwsgi.cheaper_count > 0 && uwsgi.cheaper_count >= uwsgi.numproc) {
                 uwsgi_log("invalid cheaper value: must be lower than processes\n");
@@ -419,11 +425,6 @@ void sanitize_args() {
 
         if (uwsgi.auto_snapshot > 0 && uwsgi.auto_snapshot > uwsgi.numproc) {
                 uwsgi_log("invalid auto-snapshot value: must be <= than processes\n");
-                exit(1);
-        }
-
-        if (uwsgi.static_cache_paths && !uwsgi.caches) {
-                uwsgi_log("caching of static paths requires uWSGI caching !!!\n");
                 exit(1);
         }
 

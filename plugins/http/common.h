@@ -64,13 +64,9 @@ struct http_session {
 
 	int force_chunked;
 
-#ifdef UWSGI_SSL
 	int websockets;
-	char *origin;
-	uint16_t origin_len;
 	char *websocket_key;
 	uint16_t websocket_key_len;
-#endif
 
         size_t received_body;
 
@@ -121,8 +117,6 @@ struct http_session {
 #endif
 
         int send_expect_100;
-
-        in_addr_t ip_addr;
 
         // 1 (family) + 4/16 (addr)
         char stud_prefix[17];

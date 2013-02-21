@@ -7,8 +7,8 @@ int uwsgi_routing_func_uwsgi_simple(struct wsgi_request *wsgi_req, struct uwsgi_
 
 	struct uwsgi_header *uh = (struct uwsgi_header *) ur->data;
 
-	wsgi_req->uh.modifier1 = uh->modifier1;
-	wsgi_req->uh.modifier2 = uh->modifier2;
+	wsgi_req->uh->modifier1 = uh->modifier1;
+	wsgi_req->uh->modifier2 = uh->modifier2;
 
 	// set appid
 	if (ur->data2_len > 0) {
@@ -37,55 +37,39 @@ int uwsgi_routing_func_uwsgi_remote(struct wsgi_request *wsgi_req, struct uwsgi_
 	char *addr = ur->data + sizeof(struct uwsgi_header);
 	
 	// mark a route request
-        wsgi_req->status = -17;
+        wsgi_req->via = UWSGI_VIA_ROUTE;
 
 	// append appid
 	if (ur->data2_len > 0) {
 		uwsgi_req_append(wsgi_req, "UWSGI_APPID", 11, ur->data2, ur->data2_len);
 	}
 
+	size_t remains = wsgi_req->post_cl - wsgi_req->proto_parser_remains;
+
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(4 + wsgi_req->uh->pktsize + wsgi_req->proto_parser_remains);
+	if (uwsgi_buffer_append(ub, (char *) uh, 4)) goto end;
+	if (uwsgi_buffer_append(ub, wsgi_req->buffer, uh->pktsize)) goto end;
+	uh->pktsize = wsgi_req->uh->pktsize;
+	if (wsgi_req->proto_parser_remains > 0) {
+                if (uwsgi_buffer_append(ub, wsgi_req->proto_parser_remains_buf, wsgi_req->proto_parser_remains)) {
+			goto end;
+                }
+                wsgi_req->proto_parser_remains = 0;
+        }
+
 	// ok now if have offload threads, directly use them
         if (wsgi_req->socket->can_offload) {
-		struct uwsgi_buffer *ub = uwsgi_buffer_new(4 + wsgi_req->uh.pktsize);
-		if (ub) {
-			uh->pktsize = wsgi_req->uh.pktsize;
-			if (uwsgi_buffer_append(ub, (char *) uh, 4)) goto bad;
-			if (uwsgi_buffer_append(ub, wsgi_req->buffer, uh->pktsize)) goto bad;
-                	if (!uwsgi_offload_request_net_do(wsgi_req, addr, ub)) {
-                        	wsgi_req->status = -30;
-                        	return UWSGI_ROUTE_BREAK;
-                	}
-bad:
-			uwsgi_buffer_destroy(ub);
+                if (!uwsgi_offload_request_net_do(wsgi_req, addr, ub)) {
+                       	wsgi_req->via = UWSGI_VIA_OFFLOAD;
+                       	return UWSGI_ROUTE_BREAK;
 		}
         }
 
-
-	int uwsgi_fd = uwsgi_connect(addr, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT], 0);
-	if (uwsgi_fd < 0) {
-		uwsgi_log("unable to connect to host %s\n", addr);
-		return UWSGI_ROUTE_NEXT;
-	}
-
-	int post_fd = wsgi_req->poll.fd;
-	if (wsgi_req->async_post) {
-		post_fd = fileno((FILE*)wsgi_req->async_post);
-	}
-
-	if (uwsgi_send_message(uwsgi_fd, uh->modifier1, uh->modifier2, wsgi_req->buffer, wsgi_req->uh.pktsize, post_fd, wsgi_req->post_cl, 0) < 0) {
-		uwsgi_log("unable to send uwsgi request to host %s", addr);
-		return UWSGI_ROUTE_NEXT;
-	}
-
-	ssize_t ret = uwsgi_pipe(uwsgi_fd, wsgi_req->poll.fd, 0);
-	if (ret > 0) {
-		wsgi_req->response_size += ret;
-	}
-	else {
-		uwsgi_log("unable to manage uwsgi route response for %s\n", addr);
-	}
-
-	close(uwsgi_fd);
+	if (uwsgi_proxy_nb(wsgi_req, addr, ub, remains, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT])) {
+                uwsgi_log("error routing request to uwsgi server %s\n", addr);
+        }
+end:
+	uwsgi_buffer_destroy(ub);
 	return UWSGI_ROUTE_BREAK;
 
 }

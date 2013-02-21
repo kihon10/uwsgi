@@ -121,6 +121,23 @@ int uwsgi_buffer_append(struct uwsgi_buffer *ub, char *buf, size_t len) {
 	return 0;
 }
 
+int uwsgi_buffer_append_json(struct uwsgi_buffer *ub, char *buf, size_t len) {
+	// need to escape \ and "
+	size_t i;
+	for(i=0;i<len;i++) {
+		if (buf[i] == '"') {
+			if (uwsgi_buffer_append(ub, "\\\"", 2)) return -1;
+		}
+		else if (buf[i] == '\\') {
+			if (uwsgi_buffer_append(ub, "\\\\", 2)) return -1;
+		}
+		else {
+			if (uwsgi_buffer_append(ub, buf+i, 1)) return -1;
+		}
+	}
+	return 0;
+}
+
 int uwsgi_buffer_u16le(struct uwsgi_buffer *ub, uint16_t num) {
 	uint8_t buf[2];
 	buf[0] = (uint8_t) (num & 0xff);
@@ -220,6 +237,17 @@ int uwsgi_buffer_append_keynum(struct uwsgi_buffer *ub, char *key, uint16_t keyl
 	return uwsgi_buffer_append(ub, buf, ret);
 }
 
+int uwsgi_buffer_append_valnum(struct uwsgi_buffer *ub, int64_t num) {
+        char buf[sizeof(UMAX64_STR)+1];
+        int ret = snprintf(buf, (sizeof(UMAX64_STR)+1), "%lld", (long long) num);
+        if (ret <= 0 || ret > (int) (sizeof(UMAX64_STR)+1)) {
+                return -1;
+        }
+        if (uwsgi_buffer_u16le(ub, ret)) return -1;
+        return uwsgi_buffer_append(ub, buf, ret);
+}
+
+
 int uwsgi_buffer_append_keyipv4(struct uwsgi_buffer *ub, char *key, uint16_t keylen, void *addr) {
         if (uwsgi_buffer_u16le(ub, keylen)) return -1;
         if (uwsgi_buffer_append(ub, key, keylen)) return -1;
@@ -250,7 +278,7 @@ void uwsgi_buffer_destroy(struct uwsgi_buffer *ub) {
 ssize_t uwsgi_buffer_write_simple(struct wsgi_request *wsgi_req, struct uwsgi_buffer *ub) {
 	size_t remains = ub->pos;
 	while(remains) {
-		ssize_t len = write(wsgi_req->poll.fd, ub->buf + (ub->pos - remains), remains);
+		ssize_t len = write(wsgi_req->fd, ub->buf + (ub->pos - remains), remains);
 		if (len <= 0) {
 			return len;
 		}

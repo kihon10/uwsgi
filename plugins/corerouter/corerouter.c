@@ -395,6 +395,10 @@ void corerouter_close_session(struct uwsgi_corerouter *ucr, struct corerouter_se
 	while(peers) {
 		struct corerouter_peer *tmp_peer = peers;
 		peers = peers->next;
+		// special case here for subscription system
+		if (ucr->subscriptions && tmp_peer->un && tmp_peer->un->len) {
+			tmp_peer->un->reference--;
+		}
 		uwsgi_cr_peer_del(tmp_peer);
 	}
 
@@ -567,6 +571,36 @@ struct corerouter_session *corerouter_alloc_session(struct uwsgi_corerouter *ucr
 
 	ucr->active_sessions++;
 
+	// build the client address
+	memcpy(&cs->client_sockaddr, cr_addr, cr_addr_len);
+	switch(cr_addr->sa_family) {
+		case AF_INET:
+			if (inet_ntop(AF_INET, &cs->client_sockaddr.sa_in.sin_addr, cs->client_address, cr_addr_len) == NULL) {
+				uwsgi_error("corerouter_alloc_session/inet_ntop()");
+				memcpy(cs->client_address, "0.0.0.0", 7);
+				cs->client_port[0] = '0';
+				cs->client_port[1] = 0;
+			}
+			uwsgi_num2str2(cs->client_sockaddr.sa_in.sin_port, cs->client_port);
+			break;
+#ifdef AF_INET6
+		case AF_INET6:
+			if (inet_ntop(AF_INET6, &cs->client_sockaddr.sa_in6.sin6_addr, cs->client_address, cr_addr_len) == NULL) {
+				uwsgi_error("corerouter_alloc_session/inet_ntop()");
+				memcpy(cs->client_address, "0.0.0.0", 7);
+				cs->client_port[0] = '0';
+				cs->client_port[1] = 0;
+			}
+			uwsgi_num2str2(cs->client_sockaddr.sa_in6.sin6_port, cs->client_port);
+			break;
+#endif
+		default:
+			memcpy(cs->client_address, "0.0.0.0", 7);
+			cs->client_port[0] = '0';
+			cs->client_port[1] = 0;
+			break;
+	}
+
 	// here we prepare the real session and set the hooks
 	if (ucr->alloc_session(ucr, ugs, cs, cr_addr, cr_addr_len)) {
 		corerouter_close_session(ucr, cs);
@@ -599,7 +633,7 @@ void uwsgi_corerouter_loop(int id, void *data) {
 
 
 	if (!ucr->socket_timeout)
-		ucr->socket_timeout = 30;
+		ucr->socket_timeout = 60;
 
 	if (!ucr->static_node_gracetime)
 		ucr->static_node_gracetime = 30;
@@ -692,10 +726,6 @@ void uwsgi_corerouter_loop(int id, void *data) {
                         else if (ucr->static_nodes) {
                                 ucr->mapper = uwsgi_cr_map_use_static_nodes;
                         }
-                        else if (ucr->use_cluster) {
-                                ucr->mapper = uwsgi_cr_map_use_cluster;
-                        }
-
 
 	ucr->timeouts = uwsgi_init_rb_timer();
 
@@ -853,8 +883,7 @@ int uwsgi_corerouter_has_backends(struct uwsgi_corerouter *ucr) {
                         ucr->base ||
                         (ucr->code_string_code && ucr->code_string_function) ||
                         ucr->to_socket ||
-                        ucr->static_nodes ||
-                        ucr->use_cluster
+                        ucr->static_nodes
                 ) {
                         return 1;
                 }
@@ -1009,6 +1038,7 @@ void corerouter_send_stats(struct uwsgi_corerouter *ucr) {
 					if (uwsgi_stats_keylong_comma(us, "modifier2", (unsigned long long) s_node->modifier2)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "last_check", (unsigned long long) s_node->last_check)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "requests", (unsigned long long) s_node->requests)) goto end0;
+					if (uwsgi_stats_keylong_comma(us, "last_requests", (unsigned long long) s_node->last_requests)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "tx", (unsigned long long) s_node->transferred)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "cores", (unsigned long long) s_node->cores)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "load", (unsigned long long) s_node->load)) goto end0;
