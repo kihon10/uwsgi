@@ -3,3 +3,4 @@ recursive-include buildconf *.ini
 recursive-include core *
 recursive-include plugins *
 recursive-include proto *
+recursive-include lib *
