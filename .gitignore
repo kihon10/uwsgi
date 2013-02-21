@@ -3,3 +3,5 @@
 
 /uwsgi
 /uwsgibuild.*
+dist/
+uWSGI.egg-info
