@@ -2,8 +2,24 @@
 #include "CoroAPI.h"
 
 extern struct uwsgi_server uwsgi;
+extern struct uwsgi_perl uperl;
+
+MGVTBL uwsgi_coroae_vtbl = { 0,  0,  0,  0, 0 };
 
 #define free_req_queue uwsgi.async_queue_unused_ptr++; uwsgi.async_queue_unused[uwsgi.async_queue_unused_ptr] = wsgi_req
+
+static struct wsgi_request *coroae_current_wsgi_req(void) {
+	MAGIC *mg;
+	SV *current = CORO_CURRENT;
+	for (mg = SvMAGIC (current); mg; mg = mg->mg_moremagic) {
+		if (mg->mg_type == PERL_MAGIC_ext + 1 && mg->mg_virtual == &uwsgi_coroae_vtbl) {
+        		return (struct wsgi_request *) mg->mg_ptr;
+		}
+	}	
+	uwsgi_log("[BUG] current_wsgi_req NOT FOUND !!!\n");
+	exit(1);
+}   
+
 
 SV * coroae_coro_new(CV *block) {
 	SV *newobj = NULL;
@@ -17,7 +33,7 @@ SV * coroae_coro_new(CV *block) {
         call_method("new", G_SCALAR);
         SPAGAIN;
         if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
         }
         else {
                 newobj = SvREFCNT_inc(POPs);
@@ -40,7 +56,7 @@ static int coroae_wait_fd_read(int fd, int timeout) {
         call_pv("Coro::AnyEvent::readable", G_SCALAR);
         SPAGAIN;
         if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
         }
 	else {
 		SV *p_ret = POPs;
@@ -55,7 +71,7 @@ static int coroae_wait_fd_read(int fd, int timeout) {
 	return ret;
 }
 
-int coroae_wait_fd_write(int fd, int timeout) {
+static int coroae_wait_fd_write(int fd, int timeout) {
 	int ret = 0;
         dSP;
         ENTER;
@@ -67,7 +83,7 @@ int coroae_wait_fd_write(int fd, int timeout) {
         call_pv("Coro::AnyEvent::writable", G_SCALAR);
         SPAGAIN;
         if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
         }
 	else {
 		if (SvTRUE(POPs)) {
@@ -99,7 +115,7 @@ XS(XS_coroae_accept_request) {
         }
 
 	for(;;) {
-		int ret = coroae_wait_fd_read(wsgi_req->poll.fd, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT]);
+		int ret = coroae_wait_fd_read(wsgi_req->fd, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT]);
 		wsgi_req->switches++;
 	
 		if (!ret) {
@@ -118,7 +134,7 @@ XS(XS_coroae_accept_request) {
 request:
 
         for(;;) {
-                wsgi_req->async_status = uwsgi.p[wsgi_req->uh.modifier1]->request(wsgi_req);
+                wsgi_req->async_status = uwsgi.p[wsgi_req->uh->modifier1]->request(wsgi_req);
                 if (wsgi_req->async_status <= UWSGI_OK) {
                         goto end;
                 }
@@ -171,15 +187,11 @@ edge:
                 goto clear;
         }
 
-// on linux we need to set the socket in non-blocking as it is not inherited
-#ifdef __linux__
-        uwsgi_socket_nb(wsgi_req->poll.fd);
-#endif
-
 	// here we spawn an async {} block
 	CV *async_xs_call = newXS(NULL, XS_coroae_accept_request, "uwsgi::coroae");
 	CvXSUBANY(async_xs_call).any_ptr = wsgi_req;
 	SV *coro_req = coroae_coro_new(async_xs_call);
+	sv_magicext(SvRV(coro_req), 0, PERL_MAGIC_ext + 1, &uwsgi_coroae_vtbl, (const char *)wsgi_req, 0);
 	CORO_READY(coro_req);
 
 	if (uwsgi_sock->edge_trigger) {
@@ -225,8 +237,9 @@ static SV *coroae_add_watcher(int fd, SV *cb) {
 
         SPAGAIN;
 	if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
-		newobj = NULL;
+		// no need to continue...
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
+		exit(1);
         }
 	else {
         	newobj = SvREFCNT_inc(POPs);
@@ -255,7 +268,7 @@ static SV *coroae_condvar_new() {
 
         SPAGAIN;
         if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
                 newobj = NULL;
         }
         else {
@@ -281,7 +294,7 @@ static void coroae_wait_condvar(SV *cv) {
 
         SPAGAIN;
         if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s\n", SvPV_nolen(ERRSV));
+                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
         }
         PUTBACK;
         FREETMPS;
@@ -296,6 +309,11 @@ static void coroae_loop() {
 			uwsgi_log("the Coro::AnyEvent loop engine requires async mode (--async <n>)\n");
 		}
                 exit(1);
+	}
+
+	if (!uperl.loaded) {
+		uwsgi_log("no perl/PSGI code loaded (with --psgi), unable to initialize Coro::AnyEvent\n");
+		exit(1);
 	}
 
 	perl_eval_pv("use Coro;", 0);
@@ -313,19 +331,21 @@ static void coroae_loop() {
 		uwsgi_log("unable to load Coro::AnyEvent module\n");
 		exit(1);
 	}
+	
+	uwsgi.current_wsgi_req = coroae_current_wsgi_req;
+	uwsgi.wait_write_hook = coroae_wait_fd_write;
+        uwsgi.wait_read_hook = coroae_wait_fd_read;
 
 	I_CORO_API("uwsgi::coroae");
 
 	struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
 	while(uwsgi_sock) {
-		uwsgi_log("sock = %p\n", uwsgi_sock);
 		// check return value here
 		coroae_add_watcher(uwsgi_sock->fd, (SV *) coroae_closure_acceptor(uwsgi_sock));
 		uwsgi_sock = uwsgi_sock->next;
 	};
 
 	SV *condvar = coroae_condvar_new();
-	uwsgi_log("condvar = %p\n", condvar);
 	coroae_wait_condvar(condvar);
 
 	if (uwsgi.workers[uwsgi.mywid].manage_next_request == 0) {

@@ -209,7 +209,6 @@ void logto(char *logfile) {
 
 	int fd;
 
-#ifdef UWSGI_UDP
 	char *udp_port;
 	struct sockaddr_in udp_addr;
 
@@ -245,7 +244,6 @@ void logto(char *logfile) {
 		}
 	}
 	else {
-#endif
 		if (uwsgi.log_truncate) {
 			fd = open(logfile, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP);
 		}
@@ -263,9 +261,7 @@ void logto(char *logfile) {
 				uwsgi_error("chmod()");
 			}
 		}
-#ifdef UWSGI_UDP
 	}
-#endif
 
 
 	/* stdout */
@@ -556,7 +552,7 @@ void log_request(struct wsgi_request *wsgi_req) {
 	if (uwsgi.shared->options[UWSGI_OPTION_LOG_BIG] && (wsgi_req->response_size >= uwsgi.shared->options[UWSGI_OPTION_LOG_BIG])) {
 		goto logit;
 	}
-	if (uwsgi.shared->options[UWSGI_OPTION_LOG_SENDFILE] && (wsgi_req->sendfile_fd > -1 && wsgi_req->sendfile_obj == wsgi_req->async_result)) {
+	if (uwsgi.shared->options[UWSGI_OPTION_LOG_SENDFILE] && wsgi_req->via == UWSGI_VIA_SENDFILE) {
 		goto logit;
 	}
 
@@ -601,16 +597,19 @@ void uwsgi_logit_simple(struct wsgi_request *wsgi_req) {
 		}
 	}
 
-	if (wsgi_req->sendfile_fd > -1 && wsgi_req->sendfile_obj == wsgi_req->async_result) {	//wsgi_req->sendfile_fd_size > 0 ) {
-		via = msg1;
-	}
-
-	// mark route() requests
-	if (wsgi_req->status == -17) {
-		via = msg3;
-	}
-	else if (wsgi_req->status == -30) {
-		via = msg4;
+	// mark requests via (sendfile, route, offload...)
+	switch(wsgi_req->via) {
+		case UWSGI_VIA_SENDFILE:
+			via = msg1;
+			break;
+		case UWSGI_VIA_ROUTE:
+			via = msg3;
+			break;
+		case UWSGI_VIA_OFFLOAD:
+			via = msg4;
+			break;
+		default:
+			break;	
 	}
 
 #ifdef __sun__
@@ -651,11 +650,13 @@ void uwsgi_logit_simple(struct wsgi_request *wsgi_req) {
 
 	}
 
-	rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] %.*s (%.*s) {%d vars in %d bytes} [%.*s] %.*s %.*s => generated %llu bytes in %llu %s%s(%.*s %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->remote_addr_len, wsgi_req->remote_addr, wsgi_req->remote_user_len, wsgi_req->remote_user, wsgi_req->var_cnt, wsgi_req->uh.pktsize, 24, time_request, wsgi_req->method_len, wsgi_req->method, wsgi_req->uri_len, wsgi_req->uri, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->protocol_len, wsgi_req->protocol, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
+	rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] %.*s (%.*s) {%d vars in %d bytes} [%.*s] %.*s %.*s => generated %llu bytes in %llu %s%s(%.*s %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->remote_addr_len, wsgi_req->remote_addr, wsgi_req->remote_user_len, wsgi_req->remote_user, wsgi_req->var_cnt, wsgi_req->uh->pktsize,
+			24, time_request, wsgi_req->method_len, wsgi_req->method, wsgi_req->uri_len, wsgi_req->uri, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->protocol_len, wsgi_req->protocol, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
 
 	// not enough space for logging the request, just log a (safe) minimal message
 	if (rlen > 4096) {
-		rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] 0.0.0.0 () {%d vars in %d bytes} [%.*s] - - => generated %llu bytes in %llu %s%s(- %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->var_cnt, wsgi_req->uh.pktsize, 24, time_request, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
+		rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] 0.0.0.0 () {%d vars in %d bytes} [%.*s] - - => generated %llu bytes in %llu %s%s(- %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->var_cnt, wsgi_req->uh->pktsize,
+		24, time_request, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
 		// argh, last resort, truncate it
 		if (rlen > 4096) {
 			rlen = 4096;
