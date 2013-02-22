@@ -66,6 +66,10 @@ extern "C" {
 #define MAX_PROBES 64
 #define MAX_CRONS 64
 
+#define UWSGI_VIA_SENDFILE	1
+#define UWSGI_VIA_ROUTE		2
+#define UWSGI_VIA_OFFLOAD	3
+
 #ifndef UWSGI_LOAD_EMBEDDED_PLUGINS
 #define UWSGI_LOAD_EMBEDDED_PLUGINS
 #endif
@@ -1161,6 +1165,8 @@ struct wsgi_request {
 
 	char *authorization;
 	uint16_t authorization_len;
+
+	uint16_t via;
 
 	char *script;
 	uint16_t script_len;
@@ -3086,7 +3092,11 @@ struct uwsgi_subscribe_node {
 
         time_t last_check;
 
+	// absolute number of requests
 	uint64_t requests;
+	// number of requests since last subscription ping
+	uint64_t last_requests;
+
 	uint64_t transferred;
 
 	int death_mark;
@@ -3684,7 +3694,7 @@ struct uwsgi_offload_request {
 };
 
 struct uwsgi_thread *uwsgi_offload_thread_start(void);
-int uwsgi_offload_request_sendfile_do(struct wsgi_request *, char *, size_t);
+int uwsgi_offload_request_sendfile_do(struct wsgi_request *, char *, int, size_t);
 int uwsgi_offload_request_net_do(struct wsgi_request *, char *, struct uwsgi_buffer *);
 
 void uwsgi_subscription_set_algo(char *);

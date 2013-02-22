@@ -441,16 +441,11 @@ int uwsgi_real_file_serve(struct wsgi_request *wsgi_req, char *real_filename, si
 		}
 
 		// Ok, the file must be transferred from uWSGI
-		if (wsgi_req->socket->can_offload) {
-			if (!uwsgi_offload_request_sendfile_do(wsgi_req, real_filename, st->st_size)) {
-				wsgi_req->status = -30;
-				return 0;
-			}
-		}
-
+		// offloading will be automatically managed
 		int fd = open(real_filename, O_RDONLY);
+		if (fd < 0) return -1;
+		// fd will be closed in the following function
 		uwsgi_response_sendfile_do(wsgi_req, fd, 0, st->st_size);
-		close(fd);
 	}
 
 	wsgi_req->status = 200;
