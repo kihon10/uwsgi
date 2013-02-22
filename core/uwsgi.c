@@ -45,6 +45,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"undeferred-shared-socket", required_argument, 0, "create a shared sacket for advanced jailing or ipc (undeferred mode)", uwsgi_opt_add_shared_socket, NULL, 0},
 	{"processes", required_argument, 'p', "spawn the specified number of workers/processes", uwsgi_opt_set_int, &uwsgi.numproc, 0},
 	{"workers", required_argument, 'p', "spawn the specified number of workers/processes", uwsgi_opt_set_int, &uwsgi.numproc, 0},
+	{"thunder-lock", no_argument, 0, "serialize accept() usage (if possibie)", uwsgi_opt_true, &uwsgi.use_thunder_lock, 0},
 	{"harakiri", required_argument, 't', "set harakiri timeout", uwsgi_opt_set_dyn, (void *) UWSGI_OPTION_HARAKIRI, 0},
 	{"harakiri-verbose", no_argument, 0, "enable verbose mode for harakiri", uwsgi_opt_true, &uwsgi.harakiri_verbose, 0},
 	{"harakiri-no-arh", no_argument, 0, "do not enable harakiri during after-request-hook", uwsgi_opt_true, &uwsgi.harakiri_no_arh, 0},
@@ -532,7 +533,13 @@ static struct uwsgi_option uwsgi_base_options[] = {
 
 	{"static-expires-path-info", required_argument, 0, "set the Expires header based on PATH_INFO regexp", uwsgi_opt_add_regexp_dyn_dict, &uwsgi.static_expires_path_info, UWSGI_OPT_MIME},
 	{"static-expires-path-info-mtime", required_argument, 0, "set the Expires header based on PATH_INFO regexp and file mtime", uwsgi_opt_add_regexp_dyn_dict, &uwsgi.static_expires_path_info_mtime, UWSGI_OPT_MIME},
+	{"static-gzip", required_argument, 0, "if the supplied regexp matches the static file translation it will search for a gzip version", uwsgi_opt_add_regexp_list, &uwsgi.static_gzip, UWSGI_OPT_MIME},
 #endif
+	{"static-gzip-all", no_argument, 0, "check for a gzip version of all requested static files", uwsgi_opt_true, &uwsgi.static_gzip_all, UWSGI_OPT_MIME},
+	{"static-gzip-dir", required_argument, 0, "check for a gzip version of all requested static files in the specified dir/prefix", uwsgi_opt_add_string_list, &uwsgi.static_gzip_dir, UWSGI_OPT_MIME},
+	{"static-gzip-prefix", required_argument, 0, "check for a gzip version of all requested static files in the specified dir/prefix", uwsgi_opt_add_string_list, &uwsgi.static_gzip_dir, UWSGI_OPT_MIME},
+	{"static-gzip-ext", required_argument, 0, "check for a gzip version of all requested static files with the specified ext/suffix", uwsgi_opt_add_string_list, &uwsgi.static_gzip_ext, UWSGI_OPT_MIME},
+	{"static-gzip-suffix", required_argument, 0, "check for a gzip version of all requested static files with the specified ext/suffix", uwsgi_opt_add_string_list, &uwsgi.static_gzip_ext, UWSGI_OPT_MIME},
 
 	{"offload-threads", required_argument, 0, "set the number of offload threads to spawn (per-worker, default 0)", uwsgi_opt_set_int, &uwsgi.offload_threads, 0},
 	{"offload-thread", required_argument, 0, "set the number of offload threads to spawn (per-worker, default 0)", uwsgi_opt_set_int, &uwsgi.offload_threads, 0},

@@ -34,8 +34,24 @@ extern "C" {
 
 #define wsgi_req_time ((wsgi_req->end_of_request-wsgi_req->start_of_request)/1000)
 
-#define thunder_lock if (uwsgi.threads > 1 && !uwsgi.is_et) {pthread_mutex_lock(&uwsgi.thunder_mutex);}
-#define thunder_unlock if (uwsgi.threads > 1 && !uwsgi.is_et) {pthread_mutex_unlock(&uwsgi.thunder_mutex);}
+#define thunder_lock if (!uwsgi.is_et) {\
+                        if (uwsgi.use_thunder_lock) {\
+                                uwsgi_lock(uwsgi.the_thunder_lock);\
+                        }\
+                        else if (uwsgi.threads > 1) {\
+                                pthread_mutex_lock(&uwsgi.thunder_mutex);\
+                        }\
+                    }
+
+#define thunder_unlock if (!uwsgi.is_et) {\
+                        if (uwsgi.use_thunder_lock) {\
+                                uwsgi_unlock(uwsgi.the_thunder_lock);\
+                        }\
+                        else if (uwsgi.threads > 1) {\
+                                pthread_mutex_unlock(&uwsgi.thunder_mutex);\
+                        }\
+                        }
+
 
 #define uwsgi_check_scheme(file) (!uwsgi_startswith(file, "emperor://", 10) || !uwsgi_startswith(file, "http://", 7) || !uwsgi_startswith(file, "data://", 7) || !uwsgi_startswith(file, "sym://", 6) || !uwsgi_startswith(file, "fd://", 5) || !uwsgi_startswith(file, "exec://", 7) || !uwsgi_startswith(file, "section://", 10))
 
@@ -65,6 +81,10 @@ extern "C" {
 #define MAX_TIMERS 64
 #define MAX_PROBES 64
 #define MAX_CRONS 64
+
+#define UWSGI_VIA_SENDFILE	1
+#define UWSGI_VIA_ROUTE		2
+#define UWSGI_VIA_OFFLOAD	3
 
 #ifndef UWSGI_LOAD_EMBEDDED_PLUGINS
 #define UWSGI_LOAD_EMBEDDED_PLUGINS
@@ -1152,6 +1172,9 @@ struct wsgi_request {
 	char *user_agent;
 	uint16_t user_agent_len;
 
+	char *encoding;
+	uint16_t encoding_len;
+
 	char *referer;
 	uint16_t referer_len;
 
@@ -1161,6 +1184,8 @@ struct wsgi_request {
 
 	char *authorization;
 	uint16_t authorization_len;
+
+	uint16_t via;
 
 	char *script;
 	uint16_t script_len;
@@ -1763,6 +1788,13 @@ struct uwsgi_server {
 	struct uwsgi_dyn_dict *static_expires_path_info;
 	struct uwsgi_dyn_dict *static_expires_path_info_mtime;
 
+	int static_gzip_all;
+	struct uwsgi_string_list *static_gzip_dir;
+	struct uwsgi_string_list *static_gzip_ext;
+#ifdef UWSGI_PCRE
+	struct uwsgi_regexp_list *static_gzip;
+#endif
+
 	int offload_threads;
 	int offload_threads_events;
 	struct uwsgi_thread **offload_thread;
@@ -1911,10 +1943,12 @@ struct uwsgi_server {
 
 #ifdef UWSGI_THREADING
 	// avoid thundering herd in threaded modes
+	pthread_mutex_t thunder_mutex;
 	pthread_mutex_t six_feet_under_lock;
 	pthread_mutex_t lock_static;
 #endif
-
+	int use_thunder_lock;
+	struct uwsgi_lock_item *the_thunder_lock;
 
 	/* the list of workers */
 	struct uwsgi_worker *workers;
@@ -2092,7 +2126,6 @@ struct uwsgi_server {
 	size_t queue_filesize;
 	int queue_store_sync;
 
-	pthread_mutex_t thunder_mutex;
 
 	int locks;
 
@@ -2913,6 +2946,7 @@ char *uwsgi_amqp_consume(int, uint64_t *, char **);
 
 int uwsgi_file_serve(struct wsgi_request *, char *, uint16_t, char *, uint16_t, int);
 int uwsgi_starts_with(char *, int, char *, int);
+int uwsgi_static_want_gzip(struct wsgi_request *, char *, size_t, struct stat *);
 
 #ifdef __sun__
 time_t timegm(struct tm *);
@@ -3086,7 +3120,11 @@ struct uwsgi_subscribe_node {
 
         time_t last_check;
 
+	// absolute number of requests
 	uint64_t requests;
+	// number of requests since last subscription ping
+	uint64_t last_requests;
+
 	uint64_t transferred;
 
 	int death_mark;
@@ -3684,7 +3722,7 @@ struct uwsgi_offload_request {
 };
 
 struct uwsgi_thread *uwsgi_offload_thread_start(void);
-int uwsgi_offload_request_sendfile_do(struct wsgi_request *, char *, size_t);
+int uwsgi_offload_request_sendfile_do(struct wsgi_request *, char *, int, size_t);
 int uwsgi_offload_request_net_do(struct wsgi_request *, char *, struct uwsgi_buffer *);
 
 void uwsgi_subscription_set_algo(char *);

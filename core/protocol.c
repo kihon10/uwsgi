@@ -650,6 +650,7 @@ static int uwsgi_proto_check_14(struct wsgi_request *wsgi_req, char *key, char *
 	return 0;
 }
 
+
 static int uwsgi_proto_check_15(struct wsgi_request *wsgi_req, char *key, char *buf, uint16_t len) {
 	if (!uwsgi_proto_key("SERVER_PROTOCOL", 15)) {
 		wsgi_req->protocol = buf;
@@ -695,6 +696,13 @@ static int uwsgi_proto_check_20(struct wsgi_request *wsgi_req, char *key, char *
 		wsgi_req->remote_addr_len = len;
 		return 0;
 	}
+
+	if (!uwsgi_proto_key("HTTP_ACCEPT_ENCODING", 20)) {
+		wsgi_req->encoding = buf;
+		wsgi_req->encoding_len = len;
+		return 0;
+	}
+
 	return 0;
 }
 
@@ -839,7 +847,6 @@ next:
 		// read to disk if post_cl > post_buffering (it will eventually do upload progress...)
 		if (wsgi_req->post_cl >= (size_t) uwsgi.post_buffering) {
 			if (!uwsgi_read_whole_body(wsgi_req, wsgi_req->post_buffering_buf, uwsgi.post_buffering_bufsize)) {
-				wsgi_req->status = -1;
 				return -1;
 			}
 			wsgi_req->body_as_file = 1;
@@ -847,7 +854,6 @@ next:
 		// on tiny post use memory
 		else {
 			if (!uwsgi_read_whole_body_in_mem(wsgi_req, wsgi_req->post_buffering_buf)) {
-				wsgi_req->status = -1;
 				return -1;
 			}
 		}
@@ -861,7 +867,6 @@ next:
 		if (cache_value && cache_value_size > 0) {
 			uwsgi_response_write_body_do(wsgi_req, cache_value, cache_value_size);
 			free(cache_value);
-			wsgi_req->status = -1;
 			return -1;
 		}
 	}
@@ -873,7 +878,6 @@ next:
 		if (cache_value && cache_value_size > 0) {
 			uwsgi_response_write_body_do(wsgi_req, cache_value, cache_value_size);
 			free(cache_value);
-			wsgi_req->status = -1;
 			return -1;
 		}
 	}
