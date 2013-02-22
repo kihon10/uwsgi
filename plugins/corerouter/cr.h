@@ -108,7 +108,10 @@
 	peer->connecting = 0;\
 	peer->can_retry = 0;\
         if (peer->static_node) peer->static_node->custom2++;\
-        if (peer->un) peer->un->requests++;\
+        if (peer->un) {\
+		peer->un->requests++;\
+		peer->un->last_requests++;\
+	}\
 
 
 struct corerouter_session;
@@ -227,8 +230,6 @@ struct uwsgi_corerouter {
         int use_socket;
         int socket_num;
         struct uwsgi_socket *to_socket;
-
-	int use_cluster;
 
         struct uwsgi_subscribe_slot **subscriptions;
 
