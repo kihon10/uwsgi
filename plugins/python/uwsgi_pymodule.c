@@ -820,7 +820,7 @@ PyObject *py_uwsgi_offload_transfer(PyObject * self, PyObject * args) {
 
 
 	UWSGI_RELEASE_GIL
-        if (uwsgi_offload_request_sendfile_do(wsgi_req, filename, len)) {
+        if (uwsgi_offload_request_sendfile_do(wsgi_req, filename, -1, len)) {
 		UWSGI_GET_GIL
 		return PyErr_Format(PyExc_ValueError, "unable to offload the request");
 	}
@@ -878,28 +878,11 @@ PyObject *py_uwsgi_advanced_sendfile(PyObject * self, PyObject * args) {
 		}
 	}
 
-	int tmp_fd = wsgi_req->sendfile_fd;
-	size_t tmp_filesize = wsgi_req->sendfile_fd_size;
-	size_t tmp_chunk = wsgi_req->sendfile_fd_chunk;
-	off_t tmp_pos = wsgi_req->sendfile_fd_pos;
-
-	wsgi_req->sendfile_fd = fd;
-	wsgi_req->sendfile_fd_size = filesize;
-	wsgi_req->sendfile_fd_chunk = chunk;
-	wsgi_req->sendfile_fd_pos = pos;
-
 	UWSGI_RELEASE_GIL
-	uwsgi_response_sendfile_do(wsgi_req, wsgi_req->sendfile_fd, wsgi_req->sendfile_fd_pos, wsgi_req->sendfile_fd_size);
+	// fd is closed by the following function
+	uwsgi_response_sendfile_do(wsgi_req, fd, pos, filesize);
 	UWSGI_GET_GIL
 	// revert to old values
-	wsgi_req->sendfile_fd = tmp_fd;
-	wsgi_req->sendfile_fd_size = tmp_filesize;
-	wsgi_req->sendfile_fd_chunk = tmp_chunk;
-	wsgi_req->sendfile_fd_pos = tmp_pos;
-	
-
-	close(fd);
-
 	uwsgi_py_check_write_errors {
         	uwsgi_py_write_exception(wsgi_req);
 		return NULL;
@@ -2681,7 +2664,7 @@ PyObject *py_uwsgi_route(PyObject * self, PyObject * args) {
         ui->func = NULL;
 
 	// mark a route request
-	wsgi_req->status = -17;
+	wsgi_req->via = UWSGI_VIA_ROUTE;
 
         return (PyObject *) ui;
 }
