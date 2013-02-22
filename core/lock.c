@@ -64,6 +64,12 @@ int uwsgi_pthread_robust_mutexes_enabled = 1;
 #define UWSGI_RWLOCK_SIZE	sizeof(pthread_rwlock_t)
 #endif
 
+#ifndef PTHREAD_PRIO_INHERIT
+int pthread_mutexattr_setprotocol (pthread_mutexattr_t *__attr,
+                                          int __protocol);
+#define PTHREAD_PRIO_INHERIT 1
+#endif
+
 // REMEMBER lock must contains space for both pthread_mutex_t and pthread_mutexattr_t !!! 
 struct uwsgi_lock_item *uwsgi_lock_fast_init(char *id) {
 
@@ -85,6 +91,13 @@ retry:
 	}
 
 #ifdef EOWNERDEAD
+#ifndef PTHREAD_MUTEX_ROBUST
+#define PTHREAD_MUTEX_ROBUST PTHREAD_MUTEX_ROBUST_NP
+#endif
+	if (pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)) {
+		uwsgi_log("unable to set PTHREAD_PRIO_INHERIT\n");
+		exit(1);
+	}
 	if (uwsgi_pthread_robust_mutexes_enabled) {
 		if (pthread_mutexattr_setrobust_np(&attr, PTHREAD_MUTEX_ROBUST_NP)) {
 			uwsgi_log("unable to make the mutex 'robust'\n");
@@ -614,6 +627,11 @@ ready:
 
 		// cron table lock
 		uwsgi.cron_table_lock = uwsgi_lock_init("cron");
+	}
+
+	if (uwsgi.use_thunder_lock) {
+		// process shared thunder lock
+		uwsgi.the_thunder_lock = uwsgi_lock_init("thunder");	
 	}
 
 	uwsgi.rpc_table_lock = uwsgi_lock_init("rpc");
