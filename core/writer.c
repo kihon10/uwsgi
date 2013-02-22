@@ -124,10 +124,13 @@ int uwsgi_response_write_headers_do(struct wsgi_request *wsgi_req) {
                 if (ret == UWSGI_OK) {
                         break;
                 }
-                ret = uwsgi.wait_write_hook(wsgi_req);
+                ret = uwsgi_wait_write_req(wsgi_req);
                 if (ret < 0) { wsgi_req->write_errors++; return -1;}
-                // callback based hook...
-                if (ret == UWSGI_AGAIN) return UWSGI_AGAIN;
+                if (ret == 0) {
+			uwsgi_log("uwsgi_response_write_headers_do() TIMEOUT !!!\n");
+			wsgi_req->write_errors++;
+			return -1;
+		}
         }
 
         wsgi_req->headers_size += wsgi_req->write_pos;
@@ -166,10 +169,13 @@ sendbody:
 		if (ret == UWSGI_OK) {
 			break;
 		}
-		ret = uwsgi.wait_write_hook(wsgi_req);			
+		ret = uwsgi_wait_write_req(wsgi_req);			
 		if (ret < 0) { wsgi_req->write_errors++; return -1;}
-		// callback based hook...
-		if (ret == UWSGI_AGAIN) return UWSGI_AGAIN;
+                if (ret == 0) {
+                        uwsgi_log("uwsgi_response_write_body_do() TIMEOUT !!!\n");
+                        wsgi_req->write_errors++;
+                        return -1;
+                }
 	}
 
 	wsgi_req->response_size += wsgi_req->write_pos;
@@ -181,6 +187,10 @@ sendbody:
 
 int uwsgi_response_sendfile_do(struct wsgi_request *wsgi_req, int fd, size_t pos, size_t len) {
 
+	int can_close = 1;
+
+	if (fd == wsgi_req->sendfile_fd) can_close = 0;
+
 	if (wsgi_req->write_errors) return -1;
 
 	if (!wsgi_req->headers_sent) {
@@ -188,6 +198,7 @@ int uwsgi_response_sendfile_do(struct wsgi_request *wsgi_req, int fd, size_t pos
 		if (ret == UWSGI_OK) goto sendfile;
 		if (ret == UWSGI_AGAIN) return UWSGI_AGAIN;
 		wsgi_req->write_errors++;
+		if (can_close) close(fd);
 		return -1;
 	}
 
@@ -198,10 +209,37 @@ sendfile:
 		if (fstat(fd, &st)) {
 			uwsgi_error("fstat()");
 			wsgi_req->write_errors++;
+			if (can_close) close(fd);
 			return -1;
 		}
 		len = st.st_size;
 	}
+
+	if (wsgi_req->socket->can_offload) {
+		// of we cannot close the socket (before the app will close it later)
+		// let's dup it
+		if (!can_close) {
+			int tmp_fd = dup(fd);
+			if (tmp_fd < 0) {
+				uwsgi_error("uwsgi_response_sendfile_do()/dup()");
+				wsgi_req->write_errors++;
+				return -1;
+			}
+			fd = tmp_fd;
+			can_close = 1;
+		}
+       		if (!uwsgi_offload_request_sendfile_do(wsgi_req, NULL, fd, len)) {
+                	wsgi_req->via = UWSGI_VIA_OFFLOAD;
+			wsgi_req->response_size += len;
+                        return 0;
+                }
+		wsgi_req->write_errors++;
+		if (can_close) close(fd);
+		return -1;
+	}
+
+
+        wsgi_req->via = UWSGI_VIA_SENDFILE;
 
         for(;;) {
                 int ret = wsgi_req->socket->proto_sendfile(wsgi_req, fd, pos, len);
@@ -210,13 +248,18 @@ sendfile:
                                 uwsgi_error("uwsgi_response_sendfile_do()");
                         }
 			wsgi_req->write_errors++;
+			if (can_close) close(fd);
                         return -1;
                 }
                 if (ret == UWSGI_OK) {
                         break;
                 }
-                ret = uwsgi.wait_write_hook(wsgi_req);
-                if (ret < 0) { wsgi_req->write_errors++; return -1;}
+                ret = uwsgi_wait_write_req(wsgi_req);
+                if (ret < 0) {
+			wsgi_req->write_errors++;
+			if (can_close) close(fd);
+			return -1;
+		}
                 // callback based hook...
                 if (ret == UWSGI_AGAIN) return UWSGI_AGAIN;
         }
@@ -224,13 +267,12 @@ sendfile:
         wsgi_req->response_size += wsgi_req->write_pos;
 	// reset for the next write
         wsgi_req->write_pos = 0;
-
+	// close the file descriptor
+	if (can_close) close(fd);
         return UWSGI_OK;
 }
 
 
-int uwsgi_simple_wait_write_hook(struct wsgi_request *wsgi_req) {
-	int ret = uwsgi_waitfd_write(wsgi_req->poll.fd, uwsgi.shared->options[UWSGI_OPTION_SOCKET_TIMEOUT]);
-	if (ret <= 0) return -1;
-	return UWSGI_OK;
+int uwsgi_simple_wait_write_hook(int fd, int timeout) {
+	return uwsgi_waitfd_write(fd, timeout);
 }
