@@ -1,4 +1,4 @@
-#include "uwsgi.h"
+#include <uwsgi.h>
 
 extern struct uwsgi_server uwsgi;
 
@@ -216,7 +216,7 @@ void async_add_fd_write(struct wsgi_request *wsgi_req, int fd, int timeout) {
 }
 
 void async_schedule_to_req(void) {
-	uwsgi.wsgi_req->async_status = uwsgi.p[uwsgi.wsgi_req->uh.modifier1]->request(uwsgi.wsgi_req);
+	uwsgi.wsgi_req->async_status = uwsgi.p[uwsgi.wsgi_req->uh->modifier1]->request(uwsgi.wsgi_req);
 }
 
 void async_loop() {
@@ -324,7 +324,7 @@ void async_loop() {
 					/* re-set blocking socket */
 					int arg = uwsgi_sock->arg;
 					arg &= (~O_NONBLOCK);
-					if (fcntl(uwsgi.wsgi_req->poll.fd, F_SETFL, arg) < 0) {
+					if (fcntl(uwsgi.wsgi_req->fd, F_SETFL, arg) < 0) {
 						uwsgi_error("fcntl()");
 						uwsgi.async_queue_unused_ptr++;
 						uwsgi.async_queue_unused[uwsgi.async_queue_unused_ptr] = uwsgi.wsgi_req;
