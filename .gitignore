@@ -1,7 +1,6 @@
 *.o
+dist
 *.py[co]
-
 /uwsgi
 /uwsgibuild.*
-dist/
 uWSGI.egg-info
