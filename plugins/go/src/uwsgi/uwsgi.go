@@ -29,6 +29,7 @@ import (
 	"strings"
 	"strconv"
 	"io"
+	"runtime"
 )
 
 // this stores the modifier used by the go plugin (default 11)
@@ -123,9 +124,18 @@ func RegisterSignal(signum int, who string, handler func(int)) bool {
 	return false
 }
 
+func Alarm(alarm string, msg string) {
+	a := C.CString(alarm)
+	defer C.free(unsafe.Pointer(a))
+	m := C.CString(msg)
+	defer C.free(unsafe.Pointer(m))
+        ml := len(msg)
+	C.uwsgi_alarm_trigger(a, m, C.size_t(ml))
+}
+
 // get an item from the cache
 func CacheGet(key string) []byte {
-	if int(C.uwsgi_cache_enabled()) == 0 {
+	if (C.uwsgi.caches) == nil {
                 return nil
         }
 
@@ -134,9 +144,9 @@ func CacheGet(key string) []byte {
         kl := len(key)
 	var vl C.uint64_t = C.uint64_t(0)
 
-	C.uwsgi_cache_rlock()
+	C.uwsgi_cache_rlock(C.uwsgi.caches)
 
-	c_value := C.uwsgi_cache_get(k, C.uint16_t(kl), &vl)
+	c_value := C.uwsgi_cache_get2(C.uwsgi.caches, k, C.uint16_t(kl), &vl)
 
 	var p []byte
 
@@ -146,14 +156,14 @@ func CacheGet(key string) []byte {
 		p = nil
 	}
 
-	C.uwsgi_cache_rwunlock()
+	C.uwsgi_cache_rwunlock(C.uwsgi.caches)
 
 	return p
 }
 
 // remove an intem from the cache
 func CacheDel(key string) bool {
-	if int(C.uwsgi_cache_enabled()) == 0 {
+	if (C.uwsgi.caches) == nil {
 		return false
 	}
 
@@ -161,20 +171,20 @@ func CacheDel(key string) bool {
 	defer C.free(unsafe.Pointer(k))
 	kl := len(key)
 
-	C.uwsgi_cache_wlock()
+	C.uwsgi_cache_wlock(C.uwsgi.caches)
 
-	if int(C.uwsgi_cache_del(k, C.uint16_t(kl), C.uint64_t(0), C.uint16_t(0))) < 0 {
-		C.uwsgi_cache_rwunlock();
+	if int(C.uwsgi_cache_del2(C.uwsgi.caches, k, C.uint16_t(kl), C.uint64_t(0), C.uint16_t(0))) < 0 {
+		C.uwsgi_cache_rwunlock(C.uwsgi.caches);
                 return false;
 	}
 
-        C.uwsgi_cache_rwunlock();
+        C.uwsgi_cache_rwunlock(C.uwsgi.caches);
 	return true
 }
 
 // check if an item exists in the cache
 func CacheExists(key string) bool {
-	if int(C.uwsgi_cache_enabled()) == 0 {
+	if (C.uwsgi.caches) == nil {
                 return false
         }
 
@@ -182,21 +192,21 @@ func CacheExists(key string) bool {
         defer C.free(unsafe.Pointer(k))
         kl := len(key)
 
-        C.uwsgi_cache_rlock()
+        C.uwsgi_cache_rlock(C.uwsgi.caches)
 
-        if int(C.uwsgi_cache_exists(k, C.uint16_t(kl))) > 0 {
-                C.uwsgi_cache_rwunlock();
+        if int(C.uwsgi_cache_exists2(C.uwsgi.caches, k, C.uint16_t(kl))) > 0 {
+                C.uwsgi_cache_rwunlock(C.uwsgi.caches);
                 return true;
         }
 
-        C.uwsgi_cache_rwunlock();
+        C.uwsgi_cache_rwunlock(C.uwsgi.caches);
         return false
 }
 
 // put an item in the cache
 func CacheSetFlags(key string, p []byte, expires uint64, flags int) bool {
 
-	if int(C.uwsgi_cache_enabled()) == 0 {
+	if (C.uwsgi.caches) == nil {
 		return false
 	}
 
@@ -206,14 +216,14 @@ func CacheSetFlags(key string, p []byte, expires uint64, flags int) bool {
 	v := unsafe.Pointer(&p[0])
 	vl := len(p)
 
-	C.uwsgi_cache_wlock()
+	C.uwsgi_cache_wlock(C.uwsgi.caches)
 
-        if int(C.uwsgi_cache_set(k, C.uint16_t(kl), (*C.char)(v), C.uint64_t(vl), C.uint64_t(expires), C.uint16_t(flags))) < 0 {
-                C.uwsgi_cache_rwunlock();
+        if int(C.uwsgi_cache_set2(C.uwsgi.caches, k, C.uint16_t(kl), (*C.char)(v), C.uint64_t(vl), C.uint64_t(expires), C.uint64_t(flags))) < 0 {
+                C.uwsgi_cache_rwunlock(C.uwsgi.caches);
                 return false;
         }
 
-        C.uwsgi_cache_rwunlock();
+        C.uwsgi_cache_rwunlock(C.uwsgi.caches);
 	return true
 }
 
@@ -355,14 +365,18 @@ func (br *BodyReader) Close() error {
 
 func (br *BodyReader) Read(p []byte) (n int, err error) {
 	m := len(p)
-	rlen := int(C.uwsgi_simple_request_read(br.wsgi_req, (*C.char)(unsafe.Pointer(&p[0])), C.size_t(m)))
-	if rlen < 0 {
-		err = io.ErrUnexpectedEOF
-		rlen = 0
-	} else if rlen == 0 {
-		err = io.EOF
+	var rlen C.ssize_t = C.ssize_t(0)
+        c_body := C.uwsgi_request_body_read(br.wsgi_req, C.ssize_t(m), &rlen)
+	if (c_body == C.uwsgi.empty) {
+		err = io.EOF;
+		return 0, err
+	} else if (c_body != nil) {
+		C.memcpy(unsafe.Pointer(&p[0]), unsafe.Pointer(c_body), C.size_t(rlen))
+		return int(rlen), err
 	}
-	return rlen, err
+	err = io.ErrUnexpectedEOF
+	rlen = 0
+	return int(rlen), err
 }
 
 //export uwsgi_go_helper_request
@@ -380,6 +394,11 @@ func uwsgi_go_helper_request(env *map[string]string, wsgi_req *C.struct_wsgi_req
 			http.DefaultServeMux.ServeHTTP(&w, httpReq)
 		}
 	}
+}
+
+//export uwsgi_go_helper_version
+func uwsgi_go_helper_version() *C.char {
+	return C.CString(runtime.Version())
 }
 
 //export uwsgi_go_helper_signal_handler

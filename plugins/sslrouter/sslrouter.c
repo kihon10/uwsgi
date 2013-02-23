@@ -19,7 +19,6 @@ static struct uwsgi_sslrouter {
 
 struct sslrouter_session {
 	struct corerouter_session session;
-	in_addr_t ip_addr;
 	SSL *ssl;
 };
 
@@ -75,31 +74,31 @@ static void uwsgi_opt_sslrouter(char *opt, char *value, void *cr) {
 static void uwsgi_opt_sslrouter2(char *opt, char *value, void *cr) {
         struct uwsgi_corerouter *ucr = (struct uwsgi_corerouter *) cr;
 
-        char *s_addr = NULL;
-        char *s_cert = NULL;
-        char *s_key = NULL;
-        char *s_ciphers = NULL;
-        char *s_clientca = NULL;
+        char *s2_addr = NULL;
+        char *s2_cert = NULL;
+        char *s2_key = NULL;
+        char *s2_ciphers = NULL;
+        char *s2_clientca = NULL;
 
         if (uwsgi_kvlist_parse(value, strlen(value), ',', '=',
-                        "addr", &s_addr,
-                        "cert", &s_cert,
-                        "crt", &s_cert,
-                        "key", &s_key,
-                        "ciphers", &s_ciphers,
-                        "clientca", &s_clientca,
-                        "client_ca", &s_clientca,
+                        "addr", &s2_addr,
+                        "cert", &s2_cert,
+                        "crt", &s2_cert,
+                        "key", &s2_key,
+                        "ciphers", &s2_ciphers,
+                        "clientca", &s2_clientca,
+                        "client_ca", &s2_clientca,
                         NULL)) {
                 uwsgi_log("error parsing --sslrouter option\n");
                 exit(1);
         }
 
-        if (!s_addr || !s_cert || !s_key) {
+        if (!s2_addr || !s2_cert || !s2_key) {
                 uwsgi_log("--sslrouter option needs addr, cert and key items\n");
                 exit(1);
         }
 
-        struct uwsgi_gateway_socket *ugs = uwsgi_new_gateway_socket(s_addr, ucr->name);
+        struct uwsgi_gateway_socket *ugs = uwsgi_new_gateway_socket(s2_addr, ucr->name);
         // ok we have the socket, initialize ssl if required
         if (!uwsgi.ssl_initialized) {
                 uwsgi_ssl_init();
@@ -111,7 +110,7 @@ static void uwsgi_opt_sslrouter2(char *opt, char *value, void *cr) {
                 name = uwsgi_concat3(ucr->short_name, "-", ugs->name);
         }
 
-	ugs->ctx = uwsgi_ssl_new_server_context(name, s_cert, s_key, s_ciphers, s_clientca);
+	ugs->ctx = uwsgi_ssl_new_server_context(name, s2_cert, s2_key, s2_ciphers, s2_clientca);
         if (!ugs->ctx) {
                 exit(1);
         }
@@ -132,8 +131,6 @@ static struct uwsgi_option sslrouter_options[] = {
 	{"sslrouter-use-base", required_argument, 0, "use a base dir for sslrouter hostname->server mapping", uwsgi_opt_corerouter_use_base, &usr, 0},
 
 	{"sslrouter-fallback", required_argument, 0, "fallback to the specified node in case of error", uwsgi_opt_add_string_list, &usr.cr.fallback, 0},
-
-	{"sslrouter-use-cluster", no_argument, 0, "load balance to nodes subscribed to the cluster", uwsgi_opt_true, &usr.cr.use_cluster, 0},
 
 	{"sslrouter-use-code-string", required_argument, 0, "use code string as hostname->server mapper for the sslrouter", uwsgi_opt_corerouter_cs, &usr, 0},
 	{"sslrouter-use-socket", optional_argument, 0, "forward request to the specified uwsgi socket", uwsgi_opt_corerouter_use_socket, &usr, 0},
@@ -246,7 +243,7 @@ static ssize_t sr_write(struct corerouter_peer *main_peer) {
         }
 
         else if (err == SSL_ERROR_SYSCALL) {
-                uwsgi_error("sr_write()");
+                uwsgi_cr_error(main_peer, "sr_write()");
         }
 
         else if (err == SSL_ERROR_SSL && uwsgi.ssl_verbose) {
@@ -268,11 +265,11 @@ static ssize_t sr_read(struct corerouter_peer *main_peer) {
                 int ret2 = SSL_pending(sr->ssl);
                 if (ret2 > 0) {
                         if (uwsgi_buffer_fix(main_peer->in, main_peer->in->len + ret2 )) {
-                                uwsgi_log("[uwsgi-sslrouter] cannot fix the buffer to %d\n", main_peer->in->len + ret2);
+                                uwsgi_cr_log(main_peer, "cannot fix the buffer to %d\n", main_peer->in->len + ret2);
                                 return -1;
                         }
                         if (SSL_read(sr->ssl, main_peer->in->buf + main_peer->in->pos, ret2) != ret2) {
-                                uwsgi_log("[uwsgi-sslrouter] SSL_read() on %d bytes of pending data failed\n", ret2);
+                                uwsgi_cr_log(main_peer, "SSL_read() on %d bytes of pending data failed\n", ret2);
                                 return -1;
                         }
                         // fix the buffer
@@ -325,7 +322,7 @@ static ssize_t sr_read(struct corerouter_peer *main_peer) {
         }
 
         else if (err == SSL_ERROR_SYSCALL) {
-                uwsgi_error("sr_ssl_read()");
+                uwsgi_cr_error(main_peer, "sr_ssl_read()");
         }
 
         else if (err == SSL_ERROR_SSL && uwsgi.ssl_verbose) {
@@ -349,10 +346,6 @@ static int sslrouter_alloc_session(struct uwsgi_corerouter *ucr, struct uwsgi_ga
 	cs->retry = sr_retry;
 
 	struct sslrouter_session *sr = (struct sslrouter_session *) cs;
-
-	if (sa && sa->sa_family == AF_INET) {
-                sr->ip_addr = ((struct sockaddr_in *) sa)->sin_addr.s_addr;
-        }
 
 	sr->ssl = SSL_new(ugs->ctx);
         SSL_set_fd(sr->ssl, cs->main_peer->fd);

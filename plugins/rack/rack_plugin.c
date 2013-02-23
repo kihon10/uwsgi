@@ -41,21 +41,139 @@ struct uwsgi_option uwsgi_rack_options[] = {
 
 };
 
-void uwsgi_ruby_exception(void) {
+static struct uwsgi_buffer *uwsgi_ruby_exception_class(struct wsgi_request *wsgi_req) {
+	VALUE err = rb_errinfo();
+        VALUE e = rb_class_name(rb_class_of(err));
+        struct uwsgi_buffer *ub = uwsgi_buffer_new(RSTRING_LEN(e));
+        if (uwsgi_buffer_append(ub, RSTRING_PTR(e), RSTRING_LEN(e))) {
+                uwsgi_buffer_destroy(ub);
+                return NULL;
+        }
+        return ub;
+}
 
-        VALUE lasterr = rb_gv_get("$!");
-        VALUE message = rb_obj_as_string(lasterr);
 
-        uwsgi_log("%s\n", RSTRING_PTR(message));
-        if(!NIL_P(rb_errinfo())) {
-                VALUE ary = rb_funcall(rb_errinfo(), rb_intern("backtrace"), 0);
-                int i;
-                for (i=0; i<RARRAY_LEN(ary); i++) {
-                        uwsgi_log("%s\n", RSTRING_PTR(RARRAY_PTR(ary)[i]));
-                }
+static struct uwsgi_buffer *uwsgi_ruby_exception_msg(struct wsgi_request *wsgi_req) {
+	VALUE err = rb_errinfo();
+	VALUE e = rb_funcall(err, rb_intern("message"), 0, 0);
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(RSTRING_LEN(e));
+	if (uwsgi_buffer_append(ub, RSTRING_PTR(e), RSTRING_LEN(e))) {
+		uwsgi_buffer_destroy(ub);
+		return NULL;
+	}
+	return ub;
+}
+
+static struct uwsgi_buffer *uwsgi_ruby_exception_repr(struct wsgi_request *wsgi_req) {
+	struct uwsgi_buffer *ub_class = uwsgi_ruby_exception_class(wsgi_req);
+	if (!ub_class) return NULL;
+
+	struct uwsgi_buffer *ub_msg = uwsgi_ruby_exception_msg(wsgi_req);
+	if (!ub_msg) {
+		uwsgi_buffer_destroy(ub_class);
+		return NULL;
+	}
+
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(ub_class->pos + 3 + ub_msg->pos);
+	if (uwsgi_buffer_append(ub, ub_msg->buf, ub_msg->pos)) goto error;
+	if (uwsgi_buffer_append(ub, " (", 2)) goto error;
+	if (uwsgi_buffer_append(ub, ub_class->buf, ub_class->pos)) goto error;
+	if (uwsgi_buffer_append(ub, ")", 1)) goto error;
+
+	uwsgi_buffer_destroy(ub_class);
+	uwsgi_buffer_destroy(ub_msg);
+
+	return ub;
+
+
+error:
+	uwsgi_buffer_destroy(ub_class);
+	uwsgi_buffer_destroy(ub_msg);
+	uwsgi_buffer_destroy(ub);
+	return NULL;
+
+}
+
+// simulate ruby_error_print (this is sad... but it works well)
+static void uwsgi_ruby_exception_log(struct wsgi_request *wsgi_req) {
+	VALUE err = rb_errinfo();
+	VALUE eclass = rb_class_name(rb_class_of(err));
+	VALUE msg = rb_funcall(err, rb_intern("message"), 0, 0);
+	
+	VALUE ary = rb_funcall(err, rb_intern("backtrace"), 0);
+        int i;
+        for (i=0; i<RARRAY_LEN(ary); i++) {
+		if (i == 0) {
+			uwsgi_log("%s: %s (%s)\n", RSTRING_PTR(RARRAY_PTR(ary)[i]), RSTRING_PTR(msg), RSTRING_PTR(eclass));
+		}
+		else {
+        		uwsgi_log("\tfrom %s\n", RSTRING_PTR(RARRAY_PTR(ary)[i]));
+		}
         }
 }
 
+static struct uwsgi_buffer *uwsgi_ruby_backtrace(struct wsgi_request *wsgi_req) {
+	VALUE err = rb_errinfo();
+	VALUE ary = rb_funcall(err, rb_intern("backtrace"), 0);
+	int i;
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(4096);
+	char *filename = NULL;
+	char *function = NULL;
+	for (i=0; i<RARRAY_LEN(ary); i++) {
+		char *bt = RSTRING_PTR(RARRAY_PTR(ary)[i]);
+		// ok let's start the C dance to parse the backtrace
+		char *colon = strchr(bt, ':');
+		if (!colon) continue;
+		filename = uwsgi_concat2n(bt, colon-bt, "", 0);
+		uint16_t filename_len = colon-bt;
+		colon++; if (*colon == 0) goto error;
+		char *lineno_ptr = colon;
+		colon = strchr(lineno_ptr, ':');
+		if (!colon) goto error;
+		int64_t lineno = uwsgi_str_num(lineno_ptr, colon-lineno_ptr);
+		colon++; if (*colon == 0) goto error;
+		colon = strchr(lineno_ptr, '`');
+		if (!colon) goto error;
+		colon++; if (*colon == 0) goto error;
+		char *function_ptr = colon;
+		char *function_end = strchr(function_ptr, '\'');
+		if (!function_end) goto error;
+		function = uwsgi_concat2n(function_ptr, function_end-function_ptr, "", 0);
+		uint16_t function_len = function_end-function_ptr;
+
+		if (uwsgi_buffer_u16le(ub, filename_len)) goto error;
+		if (uwsgi_buffer_append(ub, filename, filename_len)) goto error;
+		if (uwsgi_buffer_append_valnum(ub, lineno)) goto error;
+		if (uwsgi_buffer_u16le(ub, function_len)) goto error;
+		if (uwsgi_buffer_append(ub, function, function_len)) goto error;
+
+		// in ruby we do not have text/code nor custom
+		if (uwsgi_buffer_u16le(ub, 0)) goto error;
+		if (uwsgi_buffer_append(ub, "", 0)) goto error;
+		if (uwsgi_buffer_u16le(ub, 0)) goto error;
+		if (uwsgi_buffer_append(ub, "", 0)) goto error;
+
+		free(filename);
+		filename = NULL;
+		free(function);
+		function = NULL;
+	}
+
+	return ub;
+
+error:
+	uwsgi_buffer_destroy(ub);
+
+	if (filename) {
+		free(filename);
+	}
+
+	if (function) {
+		free(function);
+	}
+
+	return NULL;
+}
 
 VALUE rb_uwsgi_io_new(VALUE class, VALUE wr) {
 
@@ -76,34 +194,15 @@ VALUE rb_uwsgi_io_init(int argc, VALUE *argv, VALUE self) {
 
 VALUE rb_uwsgi_io_gets(VALUE obj, VALUE args) {
 
-	size_t i;
 	struct wsgi_request *wsgi_req;
-	VALUE line;
 	Data_Get_Struct(obj, struct wsgi_request, wsgi_req);
-	char linebuf[4096];
 
-	if (wsgi_req->async_post) {
-		if (fgets(linebuf, 4096, (FILE *) wsgi_req->async_post) == NULL) {
-			return Qnil;
-		}	
-		return rb_str_new2(linebuf);
-	}
+	ssize_t rlen = 0;
 
-	// return a line of body
-	for(i=wsgi_req->buf_pos;i<wsgi_req->post_cl;i++) {
-		if (wsgi_req->post_buffering_buf[i] == '\n') {
-			line = rb_str_new(wsgi_req->post_buffering_buf+wsgi_req->buf_pos, (i+1)-wsgi_req->buf_pos);
-			wsgi_req->buf_pos = i+1;
-			return line;
-		}
+	char *buf = uwsgi_request_body_readline(wsgi_req, 0, &rlen);
+	if (buf) {
+		return rb_str_new(buf, rlen);
 	}
-
-	if (wsgi_req->buf_pos < wsgi_req->post_cl) {
-		line = rb_str_new(wsgi_req->post_buffering_buf+wsgi_req->buf_pos, wsgi_req->post_cl-wsgi_req->buf_pos);
-                wsgi_req->buf_pos = wsgi_req->post_cl;
-                return line;
-	}
-	
 	return Qnil;
 }
 
@@ -128,101 +227,31 @@ VALUE rb_uwsgi_io_read(VALUE obj, VALUE args) {
 
 	struct wsgi_request *wsgi_req;
 	Data_Get_Struct(obj, struct wsgi_request, wsgi_req);
-	VALUE chunk;
-	long chunk_size;
+	long hint = 0;
+	int length_given = 0;
 
 /*
 	When EOF is reached, this method returns nil if length is given and not nil, or "" if length is not given or is nil.
 	If buffer is given, then the read data will be placed into buffer instead of a newly created String object.
 */
 
-	// --- disk buffering ---
-
-	if (wsgi_req->async_post) {
-		// 0 size, read the whole body from the file...
-		if (RARRAY_LEN(args) == 0) {
-			char *tmp_chunk = uwsgi_malloc(wsgi_req->post_cl);
-			size_t rlen = fread(tmp_chunk, 1, wsgi_req->post_cl, (FILE *) wsgi_req->async_post);
-			if (rlen == 0) {
-				free(tmp_chunk);
-				return rb_str_new("", 0);
-			}
-			// return a new string
-			chunk = rb_str_new(tmp_chunk, rlen);
-			free(tmp_chunk);
-			return chunk;
+	if (RARRAY_LEN(args) > 0) {
+		if (RARRAY_PTR(args)[0] != Qnil) {
+			hint = NUM2LONG(RARRAY_PTR(args)[0]); 
+			length_given = 1;
 		}
-		// size specified
-		else if (RARRAY_LEN(args) > 0) {
-			if (RARRAY_PTR(args)[0] == Qnil) {
-				chunk_size = wsgi_req->post_cl;
-			}
-			else {
-				chunk_size = NUM2LONG(RARRAY_PTR(args)[0]);
-				// hack to tolerate broken middlewares
-				if (chunk_size <= 0) {
-					chunk_size = wsgi_req->post_cl;
-				}
-			}
-			char *tmp_chunk = uwsgi_malloc(chunk_size);
-			size_t rlen = fread(tmp_chunk, 1, chunk_size, (FILE *) wsgi_req->async_post);
-			// error, return Qnil
-			if (rlen == 0) {
-				free(tmp_chunk);
-				return Qnil;
-			}
-			// push in the specified buffer
-			if (RARRAY_LEN(args) > 1) {
-                        	rb_str_cat(RARRAY_PTR(args)[1], tmp_chunk, rlen);
-			}
-			// return a new string
-			chunk = rb_str_new(tmp_chunk, rlen);
-			free(tmp_chunk);
-			return chunk;
-                }
-		// never happend...
-		return Qnil;
 	}
 
-	// --- memory buffering ---
-
-	// first check for virtual EOF
-	if (!wsgi_req->post_cl || wsgi_req->buf_pos >= wsgi_req->post_cl) {
-		if (RARRAY_LEN(args) > 0) {
-			if (RARRAY_PTR(args)[0] == Qnil) {
-				return rb_str_new("", 0);
-			}
+	ssize_t rlen = 0;
+	char *buf = uwsgi_request_body_read(wsgi_req, hint, &rlen);
+	if (buf) {
+		if (length_given && buf == uwsgi.empty) {
 			return Qnil;
 		}
-
-		return rb_str_new("", 0);
-	}
-	
-	if (RARRAY_LEN(args) == 0) {
-		chunk = rb_str_new(wsgi_req->post_buffering_buf+wsgi_req->buf_pos, wsgi_req->post_cl-wsgi_req->buf_pos);
-		wsgi_req->buf_pos += (wsgi_req->post_cl-wsgi_req->buf_pos);
-		return chunk;
-	}
-	else if (RARRAY_LEN(args) > 0) {
-		if (RARRAY_PTR(args)[0] == Qnil) {
-			chunk_size = wsgi_req->post_cl;
-		}
-		else {
-			chunk_size = NUM2LONG(RARRAY_PTR(args)[0]);
-			// hack to tolerate broken middlewares
-			if (chunk_size <= 0) {
-				chunk_size = wsgi_req->post_cl;
-			}
-		}
-		if (wsgi_req->buf_pos+chunk_size > wsgi_req->post_cl) {
-			chunk_size = wsgi_req->post_cl-wsgi_req->buf_pos;
-		}
 		if (RARRAY_LEN(args) > 1) {
-			rb_str_cat(RARRAY_PTR(args)[1], wsgi_req->post_buffering_buf+wsgi_req->buf_pos, chunk_size);
-		}
-		chunk = rb_str_new(wsgi_req->post_buffering_buf+wsgi_req->buf_pos, chunk_size);
-		wsgi_req->buf_pos+=chunk_size;
-		return chunk;
+                        rb_str_cat(RARRAY_PTR(args)[1], buf, rlen);
+                }
+		return rb_str_new(buf, rlen);
 	}
 
 	return Qnil;
@@ -232,19 +261,7 @@ VALUE rb_uwsgi_io_rewind(VALUE obj, VALUE args) {
 
 	struct wsgi_request *wsgi_req;
 	Data_Get_Struct(obj, struct wsgi_request, wsgi_req);
-
-	if (!wsgi_req->post_cl) {
-		return Qnil;
-	}
-
-	// buffered to disk ?
-	if (wsgi_req->async_post) {
-		rewind((FILE *) wsgi_req->async_post);
-	}
-	// or memory ???
-	else {
-		wsgi_req->buf_pos = 0;
-	}
+	uwsgi_request_body_seek(wsgi_req, 0);
 	return Qnil;
 }
 
@@ -301,7 +318,7 @@ uint16_t uwsgi_ruby_rpc(void *func, uint8_t argc, char **argv, uint16_t argvs[],
 	ret = rb_protect(rack_call_rpc_handler, rb_args, &error);
 
         if (error) {
-		uwsgi_ruby_exception();
+		uwsgi_manage_exception(NULL, 0);
 		return 0;
 	}
 
@@ -458,9 +475,7 @@ int uwsgi_rack_init(){
 	rb_gc_register_address(&ur.rpc_protector);
 
 
-#ifdef UWSGI_EMBEDDED
 	uwsgi_rack_init_api();	
-#endif
 
 	return 0;
 }
@@ -472,7 +487,7 @@ void uwsgi_rack_preinit_apps() {
                 int error = 0;
                 rb_protect( uwsgi_require_file, rb_str_new2(usl->value), &error ) ;
                 if (error) {
-                        uwsgi_ruby_exception();
+                        uwsgi_manage_exception(NULL, 0);
                 }
                 usl = usl->next;
         }
@@ -502,7 +517,7 @@ void uwsgi_rack_init_apps(void) {
 		error = 0;
 		rb_protect( uwsgi_require_file, rb_str_new2(usl->value), &error ) ;
                 if (error) {
-                        uwsgi_ruby_exception();
+                        uwsgi_manage_exception(NULL, 0);
 		}
 		usl = usl->next;
 	}
@@ -510,7 +525,7 @@ void uwsgi_rack_init_apps(void) {
 	if (ur.rack) {
 		ur.dispatcher = rb_protect(init_rack_app, rb_str_new2(ur.rack), &error);
 		if (error) {
-                        uwsgi_ruby_exception();
+                        uwsgi_manage_exception(NULL, 0);
                         exit(1);
                 }
 		if (ur.dispatcher == Qnil) {
@@ -534,7 +549,7 @@ void uwsgi_rack_init_apps(void) {
 		uwsgi_log("loading rails app %s\n", ur.rails);
 		rb_protect( require_rails, 0, &error ) ;
 		if (error) {
-                	uwsgi_ruby_exception();
+                	uwsgi_manage_exception(NULL, 0);
 			exit(1);
                 }
 		uwsgi_log("rails app %s ready\n", ur.rails);
@@ -556,7 +571,7 @@ void uwsgi_rack_init_apps(void) {
 			if (acim_call == Qtrue) {
                         	ur.dispatcher = rb_protect(uwsgi_rb_call_new, ac_dispatcher, &error);
 				if (error) {
-                        		uwsgi_ruby_exception();
+                        		uwsgi_manage_exception(NULL, 0);
                         		exit(1);
 				}
 			}
@@ -566,7 +581,7 @@ void uwsgi_rack_init_apps(void) {
                         uwsgi_log("non-rack rails version detected...loading thin adapter...\n");
 			rb_protect( require_thin, 0, &error ) ;
                 	if (error) {
-                        	uwsgi_ruby_exception();
+                        	uwsgi_manage_exception(NULL, 0);
                         	exit(1);
                 	}
 			VALUE thin_rack = rb_const_get(rb_cObject, rb_intern("Rack"));
@@ -574,7 +589,7 @@ void uwsgi_rack_init_apps(void) {
 			VALUE thin_rack_adapter_rails = rb_const_get(thin_rack_adapter, rb_intern("Rails"));
 			ur.dispatcher = rb_protect( uwsgi_rb_call_new, thin_rack_adapter_rails, &error);
 			if (error) {
-                        	uwsgi_ruby_exception();
+                        	uwsgi_manage_exception(NULL, 0);
                         	exit(1);
 			}
                 }
@@ -749,8 +764,8 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 	}
 
 	/* Standard RACK request */
-        if (!wsgi_req->uh.pktsize) {
-                uwsgi_log("Invalid RACK request. skip.\n");
+        if (!wsgi_req->uh->pktsize) {
+                uwsgi_log("Empty RACK request. skip.\n");
                 return -1;
         }
 
@@ -831,10 +846,15 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 	rb_hash_delete(env, rb_str_new2("HTTP_CONTENT_LENGTH"));
 	rb_hash_delete(env, rb_str_new2("HTTP_CONTENT_TYPE"));
 
-	ret = rb_protect( call_dispatch, env, &error);
-	if (error) {
-		uwsgi_ruby_exception();
-		goto clear;
+	if (ur.unprotected) {
+		ret = call_dispatch(env);
+	}
+	else {
+		ret = rb_protect( call_dispatch, env, &error);
+		if (error) {
+			uwsgi_manage_exception(wsgi_req, uwsgi.catch_exceptions);
+			goto clear;
+		}
 	}
 
 
@@ -855,7 +875,7 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 		if (rb_respond_to( headers, rb_intern("each") )) {
 			rb_protect( iterate_headers, headers, &error);
 			if (error) {
-				uwsgi_ruby_exception();
+				uwsgi_manage_exception(wsgi_req, uwsgi.catch_exceptions);
 				goto clear;
 			}
 		}
@@ -865,13 +885,13 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 		if (rb_respond_to( body, rb_intern("to_path") )) {
 			VALUE sendfile_path = rb_protect( body_to_path, body, &error);
 			if (error) {
-				uwsgi_ruby_exception();
+				uwsgi_manage_exception(wsgi_req, uwsgi.catch_exceptions);
 			}
 			else {
-				wsgi_req->sendfile_fd = open(RSTRING_PTR(sendfile_path), O_RDONLY);
-				uwsgi_response_sendfile_do(wsgi_req, wsgi_req->sendfile_fd, 0, 0);
-				// we need to close it...
-				close(wsgi_req->sendfile_fd);
+				int fd = open(RSTRING_PTR(sendfile_path), O_RDONLY);
+				if (fd < 0) goto clear;
+				// the following function will close the descriptor
+				uwsgi_response_sendfile_do(wsgi_req, fd, 0, 0);
 			}
 		}
 		else if (rb_respond_to( body, rb_intern("each") )) {
@@ -881,7 +901,7 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 			else {
 				rb_protect( iterate_body, body, &error);
 				if (error) {
-					uwsgi_ruby_exception();
+					uwsgi_manage_exception(wsgi_req, uwsgi.catch_exceptions);
 				}
 			}
 		}
@@ -890,7 +910,7 @@ int uwsgi_rack_request(struct wsgi_request *wsgi_req) {
 			//uwsgi_log("calling close\n");
 			rb_protect( close_body, body, &error);
 			if (error) {
-                                uwsgi_ruby_exception();
+				uwsgi_manage_exception(wsgi_req, uwsgi.catch_exceptions);
                         }
 		}
 
@@ -941,7 +961,7 @@ VALUE init_rack_app( VALUE script ) {
 #endif
         rb_protect( require_rack, 0, &error ) ;
         if (error) {
-        	uwsgi_ruby_exception();
+		uwsgi_manage_exception(NULL, 0);
 		return Qnil;
         }
 
@@ -1016,7 +1036,7 @@ int uwsgi_rack_mule(char *opt) {
         if (uwsgi_endswith(opt, (char *)".rb")) {
 		rb_protect( uwsgi_require_file, rb_str_new2(opt), &error ) ;
                 if (error) {
-                        uwsgi_ruby_exception();
+			uwsgi_manage_exception(NULL, 0);
 			return 0;
                 }
                 return 1;
@@ -1041,7 +1061,7 @@ void uwsgi_rb_post_fork() {
         // call the post_fork_hook
 	rb_protect(uwsgi_rb_pfh, 0, &error);
 	if (error) {
-		uwsgi_ruby_exception();
+		uwsgi_manage_exception(NULL, 0);
 	}
 }
 
@@ -1059,7 +1079,7 @@ int uwsgi_rack_mule_msg(char *message, size_t len) {
 		VALUE arg = rb_str_new(message, len);
 		rb_protect(uwsgi_rb_mmh, arg, &error);
 		if (error) {
-			uwsgi_ruby_exception();
+			uwsgi_manage_exception(NULL, 0);
 		}
         	return 1;
 	}
@@ -1085,7 +1105,7 @@ int uwsgi_rack_signal_handler(uint8_t sig, void *handler) {
         rb_ary_store(args, 1, rbsig);
         rb_protect(rack_call_signal_handler, args, &error);
         if (error) {
-                uwsgi_ruby_exception();
+		uwsgi_manage_exception(NULL, 0);
                 rb_gc();
                 return -1;
         }
@@ -1133,7 +1153,7 @@ int uwsgi_rack_spooler(char *filename, char *buf, uint16_t len, char *body, size
 
         VALUE ret = rb_protect(uwsgi_rb_do_spooler, spool_dict, &error);
 	if (error) {
-		uwsgi_ruby_exception();
+		uwsgi_manage_exception(NULL, 0);
 		rb_gc();
 		return -1;
 	}
@@ -1199,5 +1219,11 @@ struct uwsgi_plugin rack_plugin = {
 
 	.suspend = uwsgi_rack_suspend,
 	.resume = uwsgi_rack_resume,
+
+	.exception_class = uwsgi_ruby_exception_class,
+	.exception_msg = uwsgi_ruby_exception_msg,
+	.exception_repr = uwsgi_ruby_exception_repr,
+	.exception_log = uwsgi_ruby_exception_log,
+	.backtrace = uwsgi_ruby_backtrace,
 };
 

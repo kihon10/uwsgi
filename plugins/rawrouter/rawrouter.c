@@ -17,8 +17,6 @@ extern struct uwsgi_server uwsgi;
 struct rawrouter_session {
 	struct corerouter_session session;
 
-	in_addr_t ip_addr;
-
 	// XCLIENT ADDR=xxx\r\n
 	struct uwsgi_buffer *xclient;
 	size_t xclient_pos;
@@ -37,8 +35,6 @@ static struct uwsgi_option rawrouter_options[] = {
 	{"rawrouter-use-base", required_argument, 0, "use a base dir for rawrouter hostname->server mapping", uwsgi_opt_corerouter_use_base, &urr, 0},
 
 	{"rawrouter-fallback", required_argument, 0, "fallback to the specified node in case of error", uwsgi_opt_add_string_list, &urr.cr.fallback, 0},
-
-	{"rawrouter-use-cluster", no_argument, 0, "load balance to nodes subscribed to the cluster", uwsgi_opt_true, &urr.cr.use_cluster, 0},
 
 	{"rawrouter-use-code-string", required_argument, 0, "use code string as hostname->server mapper for the rawrouter", uwsgi_opt_corerouter_cs, &urr, 0},
 	{"rawrouter-use-socket", optional_argument, 0, "forward request to the specified uwsgi socket", uwsgi_opt_corerouter_use_socket, &urr, 0},
@@ -227,12 +223,11 @@ static int rawrouter_alloc_session(struct uwsgi_corerouter *ucr, struct uwsgi_ga
 	cs->retry = rr_retry;
 
 	if (sa && sa->sa_family == AF_INET) {
-		struct rawrouter_session *rr = (struct rawrouter_session *) cs;
-                rr->ip_addr = ((struct sockaddr_in *) sa)->sin_addr.s_addr;
 		if (urr.xclient) {
-			rr->xclient = uwsgi_buffer_new(13+INET_ADDRSTRLEN+2);
+			struct rawrouter_session *rr = (struct rawrouter_session *) cs;
+			rr->xclient = uwsgi_buffer_new(13+sizeof(cs->client_address)+2);
 			if (uwsgi_buffer_append(rr->xclient, "XCLIENT ADDR=", 13)) return -1;
-			if (uwsgi_buffer_append_ipv4(rr->xclient, &rr->ip_addr)) return -1;
+			if (uwsgi_buffer_append(rr->xclient, cs->client_address, strlen(cs->client_address))) return -1;
 			if (uwsgi_buffer_append(rr->xclient, "\r\n", 2)) return -1;
 		}
         }
